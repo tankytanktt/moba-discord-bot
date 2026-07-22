@@ -63,6 +63,52 @@ app.post('/api/notify', async (req, res) => {
     }
 });
 
+// --- 3.5 API Endpoint to Verify Membership ---
+app.post('/api/verify-membership', async (req, res) => {
+    // Verify API Key
+    const providedKey = req.headers['authorization'] || req.headers['x-api-key'];
+    if (providedKey !== API_KEY) {
+        return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
+    }
+
+    const { userId, inviteLink } = req.body;
+    
+    if (!userId || !inviteLink) {
+        return res.status(400).json({ error: 'Missing userId or inviteLink in request body' });
+    }
+
+    try {
+        // Resolve the invite link to get the guild info
+        const invite = await client.fetchInvite(inviteLink).catch(() => null);
+        if (!invite || !invite.guild) {
+            return res.status(400).json({ error: 'Invalid or expired invite link' });
+        }
+
+        const guildId = invite.guild.id;
+
+        // Fetch the guild from the bot's cache
+        const guild = await client.guilds.fetch(guildId).catch(() => null);
+        if (!guild) {
+            return res.status(403).json({ 
+                error: 'Bot is not in that server. The organizer MUST invite the bot to their server first.' 
+            });
+        }
+
+        // Check if the user is in the guild
+        const member = await guild.members.fetch(userId).catch(() => null);
+        
+        if (member) {
+            return res.status(200).json({ isMember: true, guildName: guild.name });
+        } else {
+            return res.status(200).json({ isMember: false, guildName: guild.name });
+        }
+
+    } catch (error) {
+        console.error(`[API Error] Failed to verify membership:`, error.message);
+        return res.status(500).json({ error: 'Internal Server Error.' });
+    }
+});
+
 // --- 4. Start Everything ---
 // Start the Express API Server
 app.listen(PORT, () => {

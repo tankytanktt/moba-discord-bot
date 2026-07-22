@@ -1,6 +1,6 @@
 # Discord Bot API Setup
 
-This bot is designed to run alongside your website. It exposes an HTTP API that your website backend can call to trigger Discord Direct Messages (DMs) to your users.
+This bot is designed to run alongside your website. It exposes an HTTP API that your website backend can call to trigger Discord Direct Messages (DMs) or verify server membership across multiple servers.
 
 ## 1. Install Node.js
 If you haven't already, download and install Node.js from [nodejs.org](https://nodejs.org/).
@@ -20,32 +20,28 @@ npm install
 ## 4. Environment Variables
 Open the `.env` file in this folder:
 1. Replace `your_bot_token_here` with the bot token.
-2. Replace `your_secret_api_key_here` with a secure random string (e.g., `super_secret_website_key`). This is used to make sure only your website can send DMs.
+2. Replace `your_secret_api_key_here` with a secure random string. This is used to make sure only your website can use the API.
 
-## 5. Invite the Bot to Your Server
-Users must share a server with the bot (or have accepted a friend request) for the bot to DM them.
-1. In the Developer Portal, go to **OAuth2 > URL Generator**.
-2. Check the `bot` scope.
-3. Copy the URL to invite the bot to your main Discord server.
+## 5. How Tournament Organizers Invite the Bot
+For the bot to verify membership in a tournament organizer's server, the bot MUST be invited to that server. 
+You should add a button to your website that links to the following URL (replace `YOUR_CLIENT_ID` with your Application ID from the Developer Portal):
+
+`https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=0&scope=bot`
 
 ## 6. Run the Bot
 In your terminal, run:
 ```bash
 npm start
 ```
-You should see it connect to both Express and Discord!
 
 ---
 
-## How to trigger a Notification from your Website
+## API Endpoints
 
-When an event happens on your website, your website's backend (PHP, Python, Node.js, etc.) should send an HTTP POST request to the bot.
+All requests must include the `x-api-key` header matching your `.env` file.
 
-**Endpoint:** `http://localhost:3000/api/notify` (Replace `localhost` with your bot's IP/Domain if hosted remotely)
-**Method:** `POST`
-**Headers:**
-- `Content-Type: application/json`
-- `x-api-key: your_secret_api_key_here` (Must match the `.env` file!)
+### 1. Send a DM
+**Endpoint:** `POST /api/notify`
 
 **Body (JSON):**
 ```json
@@ -55,10 +51,24 @@ When an event happens on your website, your website's backend (PHP, Python, Node
 }
 ```
 
-**Example (using cURL):**
-```bash
-curl -X POST http://localhost:3000/api/notify \
--H "Content-Type: application/json" \
--H "x-api-key: your_secret_api_key_here" \
--d '{"userId": "123456789012345678", "message": "Hey from the website!"}'
+### 2. Verify Server Membership
+**Endpoint:** `POST /api/verify-membership`
+
+Checks if a specific user is a member of a server, given an invite link to that server.
+*(Note: The bot must be explicitly invited to the server first using the OAuth2 link, otherwise it will return a 403 error).*
+
+**Body (JSON):**
+```json
+{
+  "userId": "123456789012345678",
+  "inviteLink": "https://discord.gg/abc123xyz"
+}
+```
+
+**Response (JSON):**
+```json
+{
+  "isMember": true,
+  "guildName": "Awesome Esports Server"
+}
 ```
