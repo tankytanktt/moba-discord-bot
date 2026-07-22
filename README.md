@@ -58,9 +58,10 @@ Checks if a specific user is a member of a server, given an invite link to that 
 *(Note: The bot must be explicitly invited to the server first using the OAuth2 link, otherwise it will return a 403 error).*
 
 **Body (JSON):**
+*(You can provide either `userId` OR `username`)*
 ```json
 {
-  "userId": "123456789012345678",
+  "username": "tankytank",
   "inviteLink": "https://discord.gg/abc123xyz"
 }
 ```

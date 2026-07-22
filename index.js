@@ -71,10 +71,10 @@ app.post('/api/verify-membership', async (req, res) => {
         return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
     }
 
-    const { userId, inviteLink } = req.body;
+    const { userId, username, inviteLink } = req.body;
     
-    if (!userId || !inviteLink) {
-        return res.status(400).json({ error: 'Missing userId or inviteLink in request body' });
+    if ((!userId && !username) || !inviteLink) {
+        return res.status(400).json({ error: 'Missing userId (or username) and inviteLink in request body' });
     }
 
     try {
@@ -94,11 +94,26 @@ app.post('/api/verify-membership', async (req, res) => {
             });
         }
 
+        let member = null;
+
         // Check if the user is in the guild
-        const member = await guild.members.fetch(userId).catch(() => null);
+        if (userId) {
+            // Option 1: Exact check by User ID
+            member = await guild.members.fetch(userId).catch(() => null);
+        } else if (username) {
+            // Option 2: Search by Username
+            const searchResults = await guild.members.fetch({ query: username, limit: 10 }).catch(() => null);
+            if (searchResults && searchResults.size > 0) {
+                // Find an exact match for username or display name
+                member = searchResults.find(m => 
+                    m.user.username.toLowerCase() === username.toLowerCase() || 
+                    (m.user.globalName && m.user.globalName.toLowerCase() === username.toLowerCase())
+                );
+            }
+        }
         
         if (member) {
-            return res.status(200).json({ isMember: true, guildName: guild.name });
+            return res.status(200).json({ isMember: true, guildName: guild.name, matchedUser: member.user.username });
         } else {
             return res.status(200).json({ isMember: false, guildName: guild.name });
         }
