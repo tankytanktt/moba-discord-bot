@@ -21,6 +21,21 @@ const client = new Client({
     ] 
 });
 
+// --- 2.5 Load Slash Commands ---
+const { Collection } = require('discord.js');
+client.commands = new Collection();
+const commandsPath = path.join(__dirname, 'src', 'commands');
+if (!fs.existsSync(commandsPath)) fs.mkdirSync(commandsPath, { recursive: true });
+
+const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
+for (const file of commandFiles) {
+    const filePath = path.join(commandsPath, file);
+    const command = require(filePath);
+    if ('data' in command && 'execute' in command) {
+        client.commands.set(command.data.name, command);
+    }
+}
+
 // --- 3. Load Event Handlers dynamically ---
 const eventsPath = path.join(__dirname, 'src', 'events');
 const eventFiles = fs.readdirSync(eventsPath).filter(file => file.endsWith('.js'));
