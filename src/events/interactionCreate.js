@@ -76,12 +76,40 @@ module.exports = {
         
         // --- 3. Handle Button Clicks ---
         else if (interaction.isButton()) {
-            const { customId, guild, member } = interaction;
+            const { customId, guild, member, user } = interaction;
             let roleToAssign = null;
             let roleNameForReply = '';
 
             try {
-                // If it's a custom mapped role (legacy support)
+                // --- LFG Button Handling ---
+                if (customId.startsWith('lfg_')) {
+                    const parts = customId.split('_'); // [ 'lfg', 'solo'/'team', 'userId' ]
+                    const lfgType = parts[1];
+                    const targetUserId = parts[2];
+
+                    if (user.id === targetUserId) {
+                        return await interaction.reply({ content: "You can't recruit yourself!", ephemeral: true });
+                    }
+
+                    const targetUser = await client.users.fetch(targetUserId).catch(() => null);
+                    if (!targetUser) {
+                        return await interaction.reply({ content: "Couldn't find that user anymore.", ephemeral: true });
+                    }
+
+                    const msgContent = lfgType === 'solo' 
+                        ? `Hey! **${user.tag}** saw your LFG post in **${guild.name}** and wants to recruit you to their team!`
+                        : `Hey! **${user.tag}** saw your Team Recruitment post in **${guild.name}** and wants to join your team!`;
+
+                    try {
+                        await targetUser.send(`${msgContent}\nReach out to them on Discord: <@${user.id}>`);
+                        await interaction.reply({ content: `Successfully sent a DM to **${targetUser.tag}** letting them know you are interested!`, ephemeral: true });
+                    } catch (err) {
+                        await interaction.reply({ content: `Failed to DM **${targetUser.tag}**. They might have their Direct Messages disabled.`, ephemeral: true });
+                    }
+                    return;
+                }
+
+                // --- Role Button Handling (legacy custom mapped role) ---
                 if (customId.startsWith('assign_')) {
                     const roleId = customId.replace('assign_', '');
                     roleToAssign = guild.roles.cache.get(roleId);
