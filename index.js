@@ -2,14 +2,15 @@ require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 // --- 1. Set up Express API Server ---
 const app = express();
-app.use(express.json()); // Allows parsing JSON bodies
-app.use(cors());         // Allows your website frontend to call this API if needed
+app.use(express.json());
+app.use(cors());
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.BOT_API_KEY;
 
 // --- 2. Set up Discord Bot ---
 const client = new Client({ 
@@ -20,115 +21,28 @@ const client = new Client({
     ] 
 });
 
-client.once('ready', () => {
-    console.log(`[Discord] Ready! Logged in as ${client.user.tag}`);
-});
+// --- 3. Load Event Handlers dynamically ---
+const eventsPath = path.join(__dirname, 'src', 'events');
+const eventFiles = fs.readdirSync(eventsPath).filter(file => file.endsWith('.js'));
 
-// --- 3. API Endpoint to Send DMs ---
-// Your website will send POST requests to this endpoint
-app.post('/api/notify', async (req, res) => {
-    // 3a. Verify API Key
-    const providedKey = req.headers['authorization'] || req.headers['x-api-key'];
-    if (providedKey !== API_KEY) {
-        return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
+for (const file of eventFiles) {
+    const filePath = path.join(eventsPath, file);
+    const event = require(filePath);
+    if (event.once) {
+        client.once(event.name, (...args) => event.execute(...args, client));
+    } else {
+        client.on(event.name, (...args) => event.execute(...args, client));
     }
+}
 
-    // 3b. Extract data from request body
-    const { userId, message } = req.body;
-    
-    if (!userId || !message) {
-        return res.status(400).json({ error: 'Missing userId or message in request body' });
-    }
+// --- 4. Load API Routes ---
+// We pass the discord client to our modular router so the API can use it
+const apiRouter = require('./src/api/apiRouter')(client);
+app.use('/api', apiRouter);
 
-    try {
-        // 3c. Fetch the user and send the DM
-        const user = await client.users.fetch(userId);
-        if (!user) {
-            return res.status(404).json({ error: 'User not found on Discord' });
-        }
-
-        await user.send(message);
-        console.log(`[API] Sent DM to user ${userId}`);
-        
-        return res.status(200).json({ success: true, message: 'Notification sent' });
-    } catch (error) {
-        console.error(`[API Error] Failed to send DM to ${userId}:`, error.message);
-        
-        // Handle common errors (e.g., user disabled DMs)
-        if (error.code === 50007) {
-            return res.status(403).json({ error: 'Cannot send messages to this user (DMs disabled or blocked)' });
-        }
-        
-        return res.status(500).json({ error: 'Internal Server Error' });
-    }
-});
-
-// --- 3.5 API Endpoint to Verify Membership ---
-app.post('/api/verify-membership', async (req, res) => {
-    // Verify API Key
-    const providedKey = req.headers['authorization'] || req.headers['x-api-key'];
-    if (providedKey !== API_KEY) {
-        return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
-    }
-
-    const { userId, username, inviteLink } = req.body;
-    
-    if ((!userId && !username) || !inviteLink) {
-        return res.status(400).json({ error: 'Missing userId (or username) and inviteLink in request body' });
-    }
-
-    try {
-        // Resolve the invite link to get the guild info
-        const invite = await client.fetchInvite(inviteLink).catch(() => null);
-        if (!invite || !invite.guild) {
-            return res.status(400).json({ error: 'Invalid or expired invite link' });
-        }
-
-        const guildId = invite.guild.id;
-
-        // Fetch the guild from the bot's cache
-        const guild = await client.guilds.fetch(guildId).catch(() => null);
-        if (!guild) {
-            return res.status(403).json({ 
-                error: 'Bot is not in that server. The organizer MUST invite the bot to their server first.' 
-            });
-        }
-
-        let member = null;
-
-        // Check if the user is in the guild
-        if (userId) {
-            // Option 1: Exact check by User ID
-            member = await guild.members.fetch(userId).catch(() => null);
-        } else if (username) {
-            // Option 2: Search by Username
-            const searchResults = await guild.members.fetch({ query: username, limit: 10 }).catch(() => null);
-            if (searchResults && searchResults.size > 0) {
-                // Find an exact match for username or display name
-                member = searchResults.find(m => 
-                    m.user.username.toLowerCase() === username.toLowerCase() || 
-                    (m.user.globalName && m.user.globalName.toLowerCase() === username.toLowerCase())
-                );
-            }
-        }
-        
-        if (member) {
-            return res.status(200).json({ isMember: true, guildName: guild.name, matchedUser: member.user.username });
-        } else {
-            return res.status(200).json({ isMember: false, guildName: guild.name });
-        }
-
-    } catch (error) {
-        console.error(`[API Error] Failed to verify membership:`, error.message);
-        return res.status(500).json({ error: 'Internal Server Error.' });
-    }
-});
-
-// --- 4. Start Everything ---
-// Start the Express API Server
+// --- 5. Start Everything ---
 app.listen(PORT, () => {
     console.log(`[Express] API Server listening on port ${PORT}`);
 });
 
-// Log in the Discord Bot
 client.login(process.env.DISCORD_TOKEN);
