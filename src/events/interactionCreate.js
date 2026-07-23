@@ -17,51 +17,53 @@ module.exports = {
         
         // --- 2. Handle Button Clicks ---
         else if (interaction.isButton()) {
-            // Check if this button is part of our roles system
-            if (interaction.customId.startsWith('role_')) {
-                // Extract the role name from the customId (e.g., "role_top" -> "Top")
-                const roleKey = interaction.customId.replace('role_', '');
-                
-                // Map the key to the actual Role Name we want to create/assign
-                const roleNames = {
-                    top: 'Top',
-                    jungle: 'Jungle',
-                    mid: 'Mid',
-                    adc: 'ADC',
-                    support: 'Support'
-                };
-                
-                const roleName = roleNames[roleKey];
-                if (!roleName) return;
+            const { customId, guild, member } = interaction;
+            let roleToAssign = null;
+            let roleNameForReply = '';
 
-                const { guild, member } = interaction;
-
-                try {
-                    // Find the role in the server
-                    let role = guild.roles.cache.find(r => r.name === roleName);
+            try {
+                // If it's a custom mapped role (assign_123456789)
+                if (customId.startsWith('assign_')) {
+                    const roleId = customId.replace('assign_', '');
+                    roleToAssign = guild.roles.cache.get(roleId);
                     
-                    // If the role doesn't exist in the server yet, create it automatically!
-                    if (!role) {
-                        role = await guild.roles.create({
-                            name: roleName,
+                    if (!roleToAssign) {
+                        return await interaction.reply({ content: 'That role no longer exists in the server!', ephemeral: true });
+                    }
+                    roleNameForReply = roleToAssign.name;
+                }
+                
+                // If it's a default role (default_Exp)
+                else if (customId.startsWith('default_')) {
+                    const defaultName = customId.replace('default_', '');
+                    
+                    // Look for it by name
+                    roleToAssign = guild.roles.cache.find(r => r.name === defaultName);
+                    
+                    // Auto-create it if it doesn't exist
+                    if (!roleToAssign) {
+                        roleToAssign = await guild.roles.create({
+                            name: defaultName,
                             reason: 'Automatically created for Button Roles',
                         });
                     }
-
-                    // Check if the user already has the role
-                    if (member.roles.cache.has(role.id)) {
-                        // Remove it
-                        await member.roles.remove(role);
-                        await interaction.reply({ content: `Removed the **${roleName}** role!`, ephemeral: true });
-                    } else {
-                        // Add it
-                        await member.roles.add(role);
-                        await interaction.reply({ content: `Given the **${roleName}** role!`, ephemeral: true });
-                    }
-                } catch (error) {
-                    console.error('Failed to handle button role:', error);
-                    await interaction.reply({ content: 'Failed to assign role. Make sure the bot has the "Manage Roles" permission and its role is placed higher than the role it is trying to assign!', ephemeral: true });
+                    roleNameForReply = roleToAssign.name;
                 }
+                else {
+                    return; // Not one of our buttons
+                }
+
+                // Check if the user already has the role
+                if (member.roles.cache.has(roleToAssign.id)) {
+                    await member.roles.remove(roleToAssign);
+                    await interaction.reply({ content: `Removed the **${roleNameForReply}** role!`, ephemeral: true });
+                } else {
+                    await member.roles.add(roleToAssign);
+                    await interaction.reply({ content: `Given the **${roleNameForReply}** role!`, ephemeral: true });
+                }
+            } catch (error) {
+                console.error('Failed to handle button role:', error);
+                await interaction.reply({ content: 'Failed to assign role. Make sure the bot has the "Manage Roles" permission and its role is placed higher than the role it is trying to assign!', ephemeral: true });
             }
         }
     },
