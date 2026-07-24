@@ -22,8 +22,13 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ] 
+        GatewayIntentBits.MessageContent,
+        // Needed for the username-based member search in
+        // /api/verify-membership (apiRouter.js) -- also requires the
+        // "Server Members Intent" toggle enabled on the Discord
+        // Developer Portal's Bot page, or the client fails to log in.
+        GatewayIntentBits.GuildMembers
+    ]
 });
 
 // --- 2.5 Load Slash Commands ---
