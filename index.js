@@ -10,6 +10,11 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// Root route for UptimeRobot health checks
+app.get('/', (req, res) => {
+    res.status(200).send('MOBA Esports OS Bot is online!');
+});
+
 const PORT = process.env.PORT || 3000;
 
 // --- 2. Set up Discord Bot ---
