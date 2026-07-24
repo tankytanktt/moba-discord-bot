@@ -1,22 +1,26 @@
 const express = require('express');
 const router = express.Router();
 
-// Middleware to verify API key for all routes in this router
-router.use((req, res, next) => {
+// Verifies API key -- applied only to routes that mutate something or
+// touch a user's DMs. /verify-membership is read-only (checks guild
+// membership, changes nothing) and deliberately skips this, since it's
+// called directly from the browser during registration and a secret
+// key can't be safely embedded in client-side JS.
+function requireApiKey(req, res, next) {
     const API_KEY = process.env.BOT_API_KEY;
     const providedKey = req.headers['authorization'] || req.headers['x-api-key'];
-    
+
     if (providedKey !== API_KEY) {
         return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
     }
     next();
-});
+}
 
 // Pass the Discord client to the router so endpoints can use it
 module.exports = (client) => {
 
     // --- 1. Send DM Notification ---
-    router.post('/notify', async (req, res) => {
+    router.post('/notify', requireApiKey, async (req, res) => {
         const { userId, message } = req.body;
         
         if (!userId || !message) {
