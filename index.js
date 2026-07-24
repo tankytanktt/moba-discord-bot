@@ -8,7 +8,21 @@ const path = require('path');
 // --- 1. Set up Express API Server ---
 const app = express();
 app.use(express.json());
-app.use(cors());
+
+// Restrict browser calls to the deployed site + local dev -- cors()
+// with no options previously allowed any origin. Requests with no
+// Origin header (health checks, curl, server-to-server) are still let
+// through since they aren't a browser CORS concern.
+const ALLOWED_ORIGINS = [
+    'https://mobaesports.netlify.app',
+    'http://localhost:8000'
+];
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        callback(new Error('Not allowed by CORS'));
+    }
+}));
 
 // Root route for UptimeRobot health checks
 app.get('/', (req, res) => {
