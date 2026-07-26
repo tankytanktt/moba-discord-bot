@@ -79,6 +79,17 @@ for (const file of eventFiles) {
 const apiRouter = require('./src/api/apiRouter')(client);
 app.use('/api', apiRouter);
 
+// Catch-all error handler -- must be registered last, and must keep all
+// 4 arguments for Express to recognize it as an error handler rather
+// than regular middleware. Without this, an unhandled thrown error falls
+// through to Express's own default handler, which includes the full
+// stack trace in the response body unless NODE_ENV=production is set --
+// not something this deploy target (Render) guarantees.
+app.use((err, req, res, next) => {
+    console.error('[Express] Unhandled error:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+});
+
 // --- 5. Start Everything ---
 app.listen(PORT, () => {
     console.log(`[Express] API Server listening on port ${PORT}`);
