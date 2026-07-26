@@ -15,6 +15,7 @@ app.use(express.json());
 // through since they aren't a browser CORS concern.
 const ALLOWED_ORIGINS = [
     'https://mobaesports.netlify.app',
+    'https://testtournamentos.netlify.app',
     'http://localhost:8000'
 ];
 app.use(cors({
