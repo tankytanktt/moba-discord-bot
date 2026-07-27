@@ -160,6 +160,69 @@ module.exports = (client) => {
         return res.status(200).json({ results });
     });
 
+    // --- 1c. Broadcast an announcement directly into a Discord channel ---
+    // Unlike /notify and /notify-by-username (both DM individuals), this
+    // posts one visible message into the channel the organizer configured
+    // for their tournament (tournaments.announcementChannelId) -- the bot
+    // must already be a member of that server, same requirement the other
+    // endpoints already have via resolveGuildMember(). A channel ID (not
+    // an invite link) is required here because an invite only identifies a
+    // *server*, not which channel to post in.
+    router.post('/broadcast-to-channel', requireApiKey, rateLimitNotify, async (req, res) => {
+        const { channelId, title, body, mentionUsernames } = req.body;
+
+        if (!channelId || !body) {
+            return res.status(400).json({ error: 'Missing channelId or body in request body' });
+        }
+
+        try {
+            const channel = await client.channels.fetch(channelId).catch(() => null);
+            if (!channel || !channel.guild || !channel.isTextBased()) {
+                return res.status(404).json({ error: 'Channel not found. Double-check the Announcement Channel ID, and make sure the bot has been invited to that server.' });
+            }
+
+            // Mentions are built from usernames WE resolve (never raw
+            // organizer text), and only ever placed in `content` --
+            // Discord doesn't parse/trigger mentions inside embeds at all,
+            // so the title/body below can never accidentally ping
+            // @everyone just because an organizer typed it in their message.
+            let mentionContent;
+            const unresolved = [];
+            if (Array.isArray(mentionUsernames) && mentionUsernames.length > 0) {
+                const mentionIds = [];
+                for (const username of mentionUsernames) {
+                    const searchResults = await channel.guild.members.fetch({ query: username, limit: 10 }).catch(() => null);
+                    const member = searchResults && searchResults.find(m =>
+                        m.user.username.toLowerCase() === username.toLowerCase() ||
+                        (m.user.globalName && m.user.globalName.toLowerCase() === username.toLowerCase())
+                    );
+                    if (member) mentionIds.push(member.id);
+                    else unresolved.push(username);
+                }
+                if (mentionIds.length > 0) mentionContent = mentionIds.map(id => `<@${id}>`).join(' ');
+            }
+
+            await channel.send({
+                content: mentionContent,
+                embeds: [{
+                    title: (title || 'Announcement').slice(0, 256),
+                    description: body.slice(0, 4096),
+                    color: 0x7C3AED,
+                    timestamp: new Date().toISOString()
+                }]
+            });
+
+            console.log(`[API] Broadcast sent to channel ${channelId}`);
+            return res.status(200).json({ success: true, unresolved });
+        } catch (error) {
+            console.error(`[API Error] Failed to broadcast to channel ${channelId}:`, error.message);
+            if (error.code === 50001 || error.code === 50013) {
+                return res.status(403).json({ error: "The bot doesn't have permission to post in that channel -- check its role permissions in Discord." });
+            }
+            return res.status(500).json({ error: 'Internal Server Error' });
+        }
+    });
+
     // --- 2. Verify Membership ---
     router.post('/verify-membership', async (req, res) => {
         const { userId, username, inviteLink } = req.body;
