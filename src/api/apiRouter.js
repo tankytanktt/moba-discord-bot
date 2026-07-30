@@ -60,9 +60,81 @@ function rateLimitNotify(req, res, next) {
     next();
 }
 
-// Shared by /verify-membership and /notify-by-username: resolves a guild
-// member by username within the server behind a given invite link.
-async function resolveGuildMember(client, inviteLink, username) {
+// ---------------------------------------------------------------
+// Session-token auth (the newer model -- see /tournament-broadcast and
+// /tournament-notify-match below).
+//
+// Instead of a shared bot key, these endpoints take the CALLER'S OWN
+// Supabase access token and forward it to an authorization RPC.
+// PostgREST derives request.jwt.claims from the bearer header no matter
+// which host sent the request, so discord_id() inside that RPC resolves
+// to the real organizer -- and every permission decision stays in SQL
+// next to all the other permission logic, rather than being
+// reimplemented here. No service-role key is involved.
+// ---------------------------------------------------------------
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+
+// One POST to PostgREST. Deliberately not @supabase/supabase-js: this is
+// a separately-deployed repo and that would be a whole dependency for a
+// single HTTP call. Node 18+ (Render's default) has global fetch.
+async function callRpc(fnName, args, bearer) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${bearer}`
+        },
+        body: JSON.stringify(args)
+    });
+    if (!res.ok) return null;   // expired/invalid token, or the RPC errored
+    return res.json();
+}
+
+// NEVER log req.userToken and never echo it in an error response -- it
+// grants everything that signed-in user can do until it expires.
+function requireUserToken(req, res, next) {
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+        return res.status(500).json({ error: 'Bot is missing its Supabase configuration.' });
+    }
+    const header = req.headers['authorization'] || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+    if (!token) {
+        return res.status(401).json({ error: 'Missing session token -- please sign in again.' });
+    }
+    req.userToken = token;
+    next();
+}
+
+// Per-caller bucket nested INSIDE the global one above. That global cap
+// was sized for "one admin, occasional deliberate sends"; these endpoints
+// are reachable by every organizer, and one of them broadcasting to a
+// 64-team roster must not be able to starve the whole platform. Hashed so
+// the raw token never becomes a Map key we might later dump while
+// debugging.
+const PER_TOKEN_MAX_REQUESTS = 5;
+const perTokenBuckets = new Map();
+
+function rateLimitPerToken(req, res, next) {
+    const key = crypto.createHash('sha256').update(req.userToken).digest('hex');
+    const now = Date.now();
+    const bucket = perTokenBuckets.get(key);
+    if (!bucket || now - bucket.windowStart > RATE_LIMIT_WINDOW_MS) {
+        perTokenBuckets.set(key, { windowStart: now, count: 1 });
+        return next();
+    }
+    if (bucket.count >= PER_TOKEN_MAX_REQUESTS) {
+        return res.status(429).json({ error: 'Too many Discord sends -- wait a minute and try again.' });
+    }
+    bucket.count++;
+    next();
+}
+
+// Resolve the guild behind an invite link. Split out of
+// resolveGuildMember() so a batch send can do this ONCE rather than
+// re-fetching the same invite for every player on the roster.
+async function resolveGuild(client, inviteLink) {
     const invite = await client.fetchInvite(inviteLink).catch(() => null);
     if (!invite || !invite.guild) {
         return { error: 'Invalid or expired invite link', status: 400 };
@@ -71,15 +143,25 @@ async function resolveGuildMember(client, inviteLink, username) {
     if (!guild) {
         return { error: 'Bot is not in that server. The organizer MUST invite the bot to their server first.', status: 403 };
     }
+    return { guild };
+}
+
+async function findMemberInGuild(guild, username) {
     const searchResults = await guild.members.fetch({ query: username, limit: 10 }).catch(() => null);
-    let member = null;
-    if (searchResults && searchResults.size > 0) {
-        member = searchResults.find(m =>
-            m.user.username.toLowerCase() === username.toLowerCase() ||
-            (m.user.globalName && m.user.globalName.toLowerCase() === username.toLowerCase())
-        );
-    }
-    return { guild, member };
+    if (!searchResults || searchResults.size === 0) return null;
+    return searchResults.find(m =>
+        m.user.username.toLowerCase() === username.toLowerCase() ||
+        (m.user.globalName && m.user.globalName.toLowerCase() === username.toLowerCase())
+    ) || null;
+}
+
+// Shared by /verify-membership and /notify-by-username: resolves a guild
+// member by username within the server behind a given invite link.
+async function resolveGuildMember(client, inviteLink, username) {
+    const resolved = await resolveGuild(client, inviteLink);
+    if (resolved.error) return resolved;
+    const member = await findMemberInGuild(resolved.guild, username);
+    return { guild: resolved.guild, member };
 }
 
 // Pass the Discord client to the router so endpoints can use it
@@ -167,9 +249,10 @@ module.exports = (client) => {
     // must already be a member of that server, same requirement the other
     // endpoints already have via resolveGuildMember(). A channel ID (not
     // an invite link) is required here because an invite only identifies a
-    // *server*, not which channel to post in.
+    // *server*, not which channel to post in. Always goes to everyone who
+    // can see the channel -- no per-player/per-team targeting.
     router.post('/broadcast-to-channel', requireApiKey, rateLimitNotify, async (req, res) => {
-        const { channelId, title, body, mentionUsernames } = req.body;
+        const { channelId, title, body } = req.body;
 
         if (!channelId || !body) {
             return res.status(400).json({ error: 'Missing channelId or body in request body' });
@@ -181,29 +264,7 @@ module.exports = (client) => {
                 return res.status(404).json({ error: 'Channel not found. Double-check the Announcement Channel ID, and make sure the bot has been invited to that server.' });
             }
 
-            // Mentions are built from usernames WE resolve (never raw
-            // organizer text), and only ever placed in `content` --
-            // Discord doesn't parse/trigger mentions inside embeds at all,
-            // so the title/body below can never accidentally ping
-            // @everyone just because an organizer typed it in their message.
-            let mentionContent;
-            const unresolved = [];
-            if (Array.isArray(mentionUsernames) && mentionUsernames.length > 0) {
-                const mentionIds = [];
-                for (const username of mentionUsernames) {
-                    const searchResults = await channel.guild.members.fetch({ query: username, limit: 10 }).catch(() => null);
-                    const member = searchResults && searchResults.find(m =>
-                        m.user.username.toLowerCase() === username.toLowerCase() ||
-                        (m.user.globalName && m.user.globalName.toLowerCase() === username.toLowerCase())
-                    );
-                    if (member) mentionIds.push(member.id);
-                    else unresolved.push(username);
-                }
-                if (mentionIds.length > 0) mentionContent = mentionIds.map(id => `<@${id}>`).join(' ');
-            }
-
             await channel.send({
-                content: mentionContent,
                 embeds: [{
                     title: (title || 'Announcement').slice(0, 256),
                     description: body.slice(0, 4096),
@@ -213,7 +274,7 @@ module.exports = (client) => {
             });
 
             console.log(`[API] Broadcast sent to channel ${channelId}`);
-            return res.status(200).json({ success: true, unresolved });
+            return res.status(200).json({ success: true });
         } catch (error) {
             console.error(`[API Error] Failed to broadcast to channel ${channelId}:`, error.message);
             if (error.code === 50001 || error.code === 50013) {
@@ -221,6 +282,101 @@ module.exports = (client) => {
             }
             return res.status(500).json({ error: 'Internal Server Error' });
         }
+    });
+
+    // --- 1d. Broadcast, authorized by the caller's own Supabase session ---
+    // Replaces /broadcast-to-channel for browser callers. The key
+    // difference is not the auth mechanism but WHERE the destination
+    // comes from: channelId is a RETURN value from the RPC, never
+    // req.body, so a caller cannot post into a channel they don't own
+    // even if the bot can see it.
+    router.post('/tournament-broadcast', requireUserToken, rateLimitNotify, rateLimitPerToken, async (req, res) => {
+        const { tournamentId, title, body } = req.body;
+
+        if (!tournamentId || !body) {
+            return res.status(400).json({ error: 'Missing tournamentId or body in request body' });
+        }
+
+        const auth = await callRpc('authorize_tournament_broadcast', { p_tournament_id: tournamentId }, req.userToken);
+        if (!auth) {
+            return res.status(401).json({ error: 'Your session could not be verified -- please sign in again.' });
+        }
+        if (!auth.allowed) {
+            return res.status(403).json({ error: auth.message });
+        }
+
+        try {
+            const channel = await client.channels.fetch(auth.channelId).catch(() => null);
+            if (!channel || !channel.guild || !channel.isTextBased()) {
+                return res.status(404).json({ error: 'Channel not found. Double-check the Announcement Channel ID, and make sure the bot has been invited to that server.' });
+            }
+
+            await channel.send({
+                embeds: [{
+                    title: (title || 'Announcement').slice(0, 256),
+                    description: String(body).slice(0, 4096),
+                    color: 0x7C3AED,
+                    timestamp: new Date().toISOString()
+                }]
+            });
+
+            console.log(`[API] Broadcast sent for tournament ${tournamentId}`);
+            return res.status(200).json({ success: true });
+        } catch (error) {
+            console.error(`[API Error] tournament-broadcast for ${tournamentId}:`, error.message);
+            if (error.code === 50001 || error.code === 50013) {
+                return res.status(403).json({ error: "The bot doesn't have permission to post in that channel -- check its role permissions in Discord." });
+            }
+            return res.status(500).json({ error: 'Internal Server Error' });
+        }
+    });
+
+    // --- 1e. Match DMs, same model ---
+    // usernames and inviteLink both come from the RPC, which resolves the
+    // roster itself scoped to the tournament. That is what stops this
+    // being a "DM any Discord user" primitive the way /notify-by-username
+    // is -- there is no roster parameter to tamper with.
+    router.post('/tournament-notify-match', requireUserToken, rateLimitNotify, rateLimitPerToken, async (req, res) => {
+        const { tournamentId, team1Id, team2Id, message } = req.body;
+
+        if (!tournamentId || !team1Id || !team2Id || !message) {
+            return res.status(400).json({ error: 'Missing tournamentId, team1Id, team2Id or message in request body' });
+        }
+
+        const auth = await callRpc('authorize_match_dm', {
+            p_tournament_id: tournamentId, p_team1_id: team1Id, p_team2_id: team2Id
+        }, req.userToken);
+        if (!auth) {
+            return res.status(401).json({ error: 'Your session could not be verified -- please sign in again.' });
+        }
+        if (!auth.allowed) {
+            return res.status(403).json({ error: auth.message });
+        }
+
+        // Invite resolved ONCE for the whole roster, not per player.
+        const resolved = await resolveGuild(client, auth.inviteLink);
+        if (resolved.error) {
+            return res.status(resolved.status).json({ error: resolved.error });
+        }
+
+        const body = String(message).slice(0, 2000);
+        const results = [];
+        for (const username of auth.usernames) {
+            try {
+                const member = await findMemberInGuild(resolved.guild, username);
+                if (!member) {
+                    results.push({ username, success: false, error: 'Not found in server' });
+                    continue;
+                }
+                await member.user.send(body);
+                results.push({ username, success: true });
+            } catch (error) {
+                console.error(`[API Error] Failed to DM ${username}:`, error.message);
+                results.push({ username, success: false, error: error.code === 50007 ? 'DMs disabled or blocked' : 'Send failed' });
+            }
+        }
+
+        return res.status(200).json({ results });
     });
 
     // --- 2. Verify Membership ---
