@@ -101,18 +101,34 @@ async function callRpc(fnName, args, bearer) {
 // BOT_API_KEY: never log it, never echo it in a response.
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+// Callers treat a null return as "couldn't complete the request" and
+// respond with a clean 500 -- so every failure mode here, including a
+// missing/invalid SUPABASE_URL, must resolve to null rather than throw.
+// An async Express route handler doesn't catch a rejected promise on
+// its own; letting one escape becomes an unhandled rejection that
+// crashes the whole process (Discord connection included), not just
+// the one request -- which is exactly what took this bot down.
 async function callRpcAsService(fnName, args) {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            apikey: SUPABASE_SERVICE_ROLE_KEY,
-            Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
-        },
-        body: JSON.stringify(args)
-    });
-    if (!res.ok) return null;
-    return res.json();
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+        console.error(`[API] callRpcAsService(${fnName}): missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY`);
+        return null;
+    }
+    try {
+        const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                apikey: SUPABASE_SERVICE_ROLE_KEY,
+                Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+            },
+            body: JSON.stringify(args)
+        });
+        if (!res.ok) return null;
+        return res.json();
+    } catch (err) {
+        console.error(`[API] callRpcAsService(${fnName}) failed:`, err.message);
+        return null;
+    }
 }
 
 // NEVER log req.userToken and never echo it in an error response -- it
