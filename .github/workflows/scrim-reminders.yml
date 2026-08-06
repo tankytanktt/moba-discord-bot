@@ -18,6 +18,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Hit the reminder-tick endpoint
+        # -f alone (the original version of this step) hides the actual
+        # response body/status on any non-2xx, which makes a failure here
+        # undebuggable from the Action log alone. Capture the status and
+        # body explicitly, print both, THEN fail the step on a bad status
+        # -- same end result (red X on error) with an actual reason visible.
         run: |
-          curl -sf -X POST "${{ secrets.BOT_BASE_URL }}/api/scrim-reminders-tick" \
-            -H "x-api-key: ${{ secrets.BOT_API_KEY }}"
+          http_code=$(curl -s -o response.txt -w "%{http_code}" -X POST "${{ secrets.BOT_BASE_URL }}/api/scrim-reminders-tick" \
+            -H "x-api-key: ${{ secrets.BOT_API_KEY }}")
+          echo "HTTP status: $http_code"
+          echo "Response body:"
+          cat response.txt
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            exit 1
+          fi
