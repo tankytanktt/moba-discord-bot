@@ -92,6 +92,29 @@ async function callRpc(fnName, args, bearer) {
     return res.json();
 }
 
+// Only used by /scrim-reminders-tick, which has no signed-in caller to
+// forward a session for (it's woken up by a scheduled GitHub Actions
+// workflow, not a browser). A service-role key bypasses RLS/grants
+// entirely -- this is the FIRST time this bot talks to Supabase as
+// itself rather than relaying an already-authenticated user's own
+// session, so treat SUPABASE_SERVICE_ROLE_KEY with the same care as
+// BOT_API_KEY: never log it, never echo it in a response.
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+async function callRpcAsService(fnName, args) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fnName}`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            apikey: SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+        },
+        body: JSON.stringify(args)
+    });
+    if (!res.ok) return null;
+    return res.json();
+}
+
 // NEVER log req.userToken and never echo it in an error response -- it
 // grants everything that signed-in user can do until it expires.
 function requireUserToken(req, res, next) {
@@ -164,6 +187,26 @@ async function resolveGuildMember(client, inviteLink, username) {
     return { guild: resolved.guild, member };
 }
 
+// Shared by /notify, /scrim-notify, and /scrim-reminders-tick -- every
+// place in this file that DMs one Discord user by numeric id. Returns a
+// plain result object instead of writing to `res` directly, since each
+// caller needs a different HTTP response shape wrapped around the same
+// core action (a single DM vs. a per-recipient loop).
+async function dmUserById(client, userId, message) {
+    try {
+        const user = await client.users.fetch(userId).catch(() => null);
+        if (!user) return { ok: false, status: 404, error: 'User not found on Discord' };
+        await user.send(message);
+        return { ok: true };
+    } catch (error) {
+        console.error(`[API Error] Failed to send DM to ${userId}:`, error.message);
+        if (error.code === 50007) {
+            return { ok: false, status: 403, error: 'Cannot send messages to this user (DMs disabled or blocked)' };
+        }
+        return { ok: false, status: 500, error: 'Internal Server Error' };
+    }
+}
+
 // Pass the Discord client to the router so endpoints can use it
 module.exports = (client) => {
 
@@ -181,28 +224,73 @@ module.exports = (client) => {
     // --- 1. Send DM Notification ---
     router.post('/notify', requireApiKey, rateLimitNotify, async (req, res) => {
         const { userId, message } = req.body;
-        
+
         if (!userId || !message) {
             return res.status(400).json({ error: 'Missing userId or message in request body' });
         }
 
-        try {
-            const user = await client.users.fetch(userId).catch(() => null);
-            if (!user) {
-                return res.status(404).json({ error: 'User not found on Discord' });
-            }
+        const result = await dmUserById(client, userId, message);
+        if (!result.ok) return res.status(result.status).json({ error: result.error });
+        console.log(`[API] Sent DM to user ${userId}`);
+        return res.status(200).json({ success: true, message: 'Notification sent' });
+    });
 
-            await user.send(message);
-            console.log(`[API] Sent DM to user ${userId}`);
-            
-            return res.status(200).json({ success: true, message: 'Notification sent' });
-        } catch (error) {
-            console.error(`[API Error] Failed to send DM to ${userId}:`, error.message);
-            if (error.code === 50007) {
-                return res.status(403).json({ error: 'Cannot send messages to this user (DMs disabled or blocked)' });
-            }
-            return res.status(500).json({ error: 'Internal Server Error' });
+    // --- 1f. Scrim event DMs (challenge received/accepted/rejected),
+    // same session-token model as /tournament-notify-match: the caller's
+    // own Supabase session is forwarded to authorize_scrim_dm(), which
+    // resolves the correct recipient (the OTHER squad's owner) server-
+    // side rather than trusting a userId the client could tamper with.
+    router.post('/scrim-notify', requireUserToken, rateLimitNotify, rateLimitPerToken, async (req, res) => {
+        const { scrimId, event } = req.body; // event: 'challenged' | 'accepted' | 'rejected'
+        if (!scrimId || !event) {
+            return res.status(400).json({ error: 'Missing scrimId or event in request body' });
         }
+
+        const auth = await callRpc('authorize_scrim_dm', { p_scrim_id: scrimId }, req.userToken);
+        if (!auth) {
+            return res.status(401).json({ error: 'Your session could not be verified -- please sign in again.' });
+        }
+        if (!auth.allowed) {
+            return res.status(403).json({ error: auth.message });
+        }
+
+        const messages = {
+            challenged: 'Your scrim listing just received a new challenge!',
+            accepted: 'Your scrim challenge was accepted -- check the lobby for details.',
+            rejected: 'Your scrim challenge was declined.'
+        };
+        // 'challenged' notifies the CREATOR (someone challenged them);
+        // 'accepted'/'rejected' notify the CHALLENGER (the creator responded).
+        const targetOwnerId = event === 'challenged' ? auth.creatorOwnerId : auth.opponentOwnerId;
+
+        const result = await dmUserById(client, targetOwnerId, messages[event] || 'Scrim update.');
+        if (!result.ok) return res.status(result.status).json({ error: result.error });
+        return res.status(200).json({ success: true });
+    });
+
+    // --- 1g. Scheduled scrim reminders -- shared-secret model like
+    // /notify, since a cron trigger has no signed-in user to forward a
+    // session for. Uses the Supabase SERVICE ROLE key (a new trust
+    // boundary for this bot -- see callRpcAsService above) to reach
+    // get_scrims_needing_reminder()/mark_scrim_reminder_sent(), both
+    // deliberately ungranted to authenticated/anon in supabase_migration_rls.sql
+    // section 17 -- this endpoint is the only way either is reachable.
+    router.post('/scrim-reminders-tick', requireApiKey, async (req, res) => {
+        const scrims = await callRpcAsService('get_scrims_needing_reminder', {});
+        if (!scrims) {
+            return res.status(500).json({ error: 'Could not reach Supabase for the reminder query.' });
+        }
+
+        let sent = 0;
+        for (const s of scrims) {
+            for (const ownerId of [s.creatorOwnerId, s.opponentOwnerId]) {
+                const result = await dmUserById(client, ownerId, `Reminder: your scrim starts soon (${s.scheduledAt}).`);
+                if (result.ok) sent++;
+            }
+            await callRpcAsService('mark_scrim_reminder_sent', { p_scrim_id: s.id });
+        }
+        console.log(`[API] Scrim reminder tick: ${scrims.length} scrim(s), ${sent} DM(s) sent`);
+        return res.status(200).json({ ok: true, scrimsProcessed: scrims.length, remindersSent: sent });
     });
 
     // --- 1b. Notify a batch of players by Discord username ---

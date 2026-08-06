@@ -1,0 +1,23 @@
+name: Scrim reminder tick
+
+# Nothing in the bot's own stack can wake itself up on a timer (no
+# cron, no scheduler) -- this workflow is that missing piece. GitHub's
+# own cron granularity is a 5-minute minimum, and schedules can slip
+# 10-30+ minutes under load, which is exactly why
+# get_scrims_needing_reminder() (supabase_migration_rls.sql, section
+# 17) queries a 20-minute window guarded by a reminderSentAt column,
+# not an exact-minute match -- this trigger only needs to land inside
+# that window at least once per scrim, not on a precise schedule.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {} # manual trigger, for testing before trusting the schedule
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit the reminder-tick endpoint
+        run: |
+          curl -sf -X POST "${{ secrets.BOT_BASE_URL }}/api/scrim-reminders-tick" \
+            -H "x-api-key: ${{ secrets.BOT_API_KEY }}"
