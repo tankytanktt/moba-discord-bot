@@ -27,7 +27,7 @@ app.use(cors({
 
 // Root route for UptimeRobot health checks
 app.get('/', (req, res) => {
-    res.status(200).send('MOBA Esports OS Bot is online!');
+    res.status(200).send('MSP Bot is online!');
 });
 
 const PORT = process.env.PORT || 3000;

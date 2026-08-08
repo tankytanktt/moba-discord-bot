@@ -11,7 +11,7 @@ module.exports = {
             .setTitle('Select Your Game!')
             .setDescription('Please select which MOBA you play from the dropdown menu below. You will then receive your specific lane roles!')
             .setColor('#3498db')
-            .setFooter({ text: 'MOBA Esports OS' });
+            .setFooter({ text: 'MSP' });
 
         const select = new StringSelectMenuBuilder()
             .setCustomId('game_select')

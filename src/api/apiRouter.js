@@ -257,7 +257,7 @@ module.exports = (client) => {
     // resolves the correct recipient (the OTHER squad's owner) server-
     // side rather than trusting a userId the client could tamper with.
     router.post('/scrim-notify', requireUserToken, rateLimitNotify, rateLimitPerToken, async (req, res) => {
-        const { scrimId, event } = req.body; // event: 'challenged' | 'accepted' | 'rejected'
+        const { scrimId, event, message } = req.body; // event: 'challenged' | 'accepted' | 'rejected' | 'reminder'
         if (!scrimId || !event) {
             return res.status(400).json({ error: 'Missing scrimId or event in request body' });
         }
@@ -273,13 +273,29 @@ module.exports = (client) => {
         const messages = {
             challenged: 'Your scrim listing just received a new challenge!',
             accepted: 'Your scrim challenge was accepted -- check the lobby for details.',
-            rejected: 'Your scrim challenge was declined.'
+            rejected: 'Your scrim challenge was declined.',
+            reminder: 'Your opponent is nudging you about your upcoming scrim -- check the lobby for details.'
         };
+        // 'reminder' is the only event with an editable compose step (the
+        // scrim lobby's Notify modal) -- challenged/accepted/rejected fire
+        // automatically from other actions with no textarea behind them,
+        // so a client-supplied message there would just be trusting
+        // unvalidated input for events that should always say exactly
+        // what happened. Same length cap as /tournament-notify-match's
+        // custom-message path, above, scaled down for a single-recipient nudge.
+        const trimmedMessage = typeof message === 'string' ? message.trim() : '';
+        const body = (event === 'reminder' && trimmedMessage) ? trimmedMessage.slice(0, 500) : (messages[event] || 'Scrim update.');
+
         // 'challenged' notifies the CREATOR (someone challenged them);
         // 'accepted'/'rejected' notify the CHALLENGER (the creator responded).
-        const targetOwnerId = event === 'challenged' ? auth.creatorOwnerId : auth.opponentOwnerId;
+        // 'reminder' is symmetric -- either side can click it, so the
+        // target is always whichever side ISN'T the caller, resolved from
+        // authorize_scrim_dm's callerIsCreator rather than a fixed role.
+        const targetOwnerId = event === 'reminder'
+            ? (auth.callerIsCreator ? auth.opponentOwnerId : auth.creatorOwnerId)
+            : (event === 'challenged' ? auth.creatorOwnerId : auth.opponentOwnerId);
 
-        const result = await dmUserById(client, targetOwnerId, messages[event] || 'Scrim update.');
+        const result = await dmUserById(client, targetOwnerId, body);
         if (!result.ok) return res.status(result.status).json({ error: result.error });
         return res.status(200).json({ success: true });
     });
