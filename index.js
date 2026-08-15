@@ -7,7 +7,14 @@ const path = require('path');
 
 // --- 1. Set up Express API Server ---
 const app = express();
-app.use(express.json());
+// verify captures the raw request bytes onto req.rawBody without changing
+// anything else -- req.body stays parsed JSON for every existing route.
+// Only the Razorpay webhook handler (src/api/apiRouter.js) reads
+// req.rawBody, since webhook signature verification is computed over the
+// exact raw payload, not the re-serialized parsed object.
+app.use(express.json({
+    verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 
 // Restrict browser calls to the deployed site + local dev -- cors()
 // with no options previously allowed any origin. Requests with no

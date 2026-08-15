@@ -16,6 +16,34 @@ function safeKeysMatch(a, b) {
     return crypto.timingSafeEqual(bufA, bufB);
 }
 
+// Razorpay/RazorpayX webhook verification -- a third auth model
+// alongside requireApiKey/requireUserToken below, needed because
+// Razorpay's own servers call these endpoints directly (no shared bot
+// key, no user session to forward). Verifies an HMAC-SHA256 signature
+// computed over the RAW request body against a per-webhook secret --
+// reuses safeKeysMatch so this gets the same constant-time-compare
+// protection as the shared-key model. req.rawBody is populated by the
+// express.json({verify}) callback in index.js; if that's ever missing
+// (e.g. a body-less request), this fails closed rather than skipping
+// the check.
+function verifyRazorpaySignature(getSecret) {
+    return (req, res, next) => {
+        const secret = getSecret();
+        if (!secret) {
+            return res.status(500).json({ error: 'Payments are not configured on the bot yet.' });
+        }
+        const signature = req.headers['x-razorpay-signature'];
+        if (!signature || !req.rawBody) {
+            return res.status(400).json({ error: 'Missing signature or body.' });
+        }
+        const expected = crypto.createHmac('sha256', secret).update(req.rawBody).digest('hex');
+        if (!safeKeysMatch(signature, expected)) {
+            return res.status(401).json({ error: 'Invalid webhook signature.' });
+        }
+        next();
+    };
+}
+
 // Verifies API key -- applied only to routes that mutate something or
 // touch a user's DMs. /verify-membership is read-only (checks guild
 // membership, changes nothing) and deliberately skips this, since it's
@@ -127,6 +155,49 @@ async function callRpcAsService(fnName, args) {
         return res.json();
     } catch (err) {
         console.error(`[API] callRpcAsService(${fnName}) failed:`, err.message);
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------
+// Razorpay -- raw fetch, same reasoning as callRpc above (Node 18+ has
+// global fetch; the official `razorpay` SDK would be a whole dependency
+// for what's a handful of straightforward REST calls). RAZORPAY_KEY_ID
+// is not secret (it's also in settings.razorpayKeyId for Checkout.js);
+// RAZORPAY_KEY_SECRET and RAZORPAY_WEBHOOK_SECRET never leave this
+// process -- never logged, never echoed in a response, same discipline
+// as BOT_API_KEY/SUPABASE_SERVICE_ROLE_KEY above.
+// ---------------------------------------------------------------
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+
+function razorpayConfigured() {
+    return !!(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET);
+}
+
+// Returns null on any failure (network, non-2xx, malformed JSON) --
+// callers treat null as "couldn't reach Razorpay" and respond with a
+// clean 502, same discipline callRpcAsService uses for a missing
+// Supabase config.
+async function razorpayFetch(path, options = {}) {
+    try {
+        const auth = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString('base64');
+        const res = await fetch(`https://api.razorpay.com/v1${path}`, {
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Basic ${auth}`,
+                ...(options.headers || {})
+            }
+        });
+        if (!res.ok) {
+            const body = await res.text().catch(() => '');
+            console.error(`[Razorpay] ${path} -> ${res.status}: ${body.slice(0, 300)}`);
+            return null;
+        }
+        return res.json();
+    } catch (err) {
+        console.error(`[Razorpay] ${path} failed:`, err.message);
         return null;
     }
 }
@@ -546,6 +617,157 @@ module.exports = (client) => {
             console.error(`[API Error] Failed to verify membership:`, error.message);
             return res.status(500).json({ error: 'Internal Server Error.' });
         }
+    });
+
+    // ---------------------------------------------------------------
+    // 3. Paid tournament registration (Razorpay). See
+    // supabase_migration_rls.sql section 32 for the full design --
+    // register_team() is never called directly for a paid tournament;
+    // complete_registration_payment() (called from both routes below)
+    // is the only thing that inserts the team, and only after a
+    // verified signature. Every route here is a no-op 500 until
+    // RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET/RAZORPAY_WEBHOOK_SECRET are
+    // set in this process's own .env -- there is no dependency on
+    // settings.razorpayKeyId for anything server-side, that column
+    // exists only for Checkout.js in the browser.
+    // ---------------------------------------------------------------
+
+    // 3a. Create a Razorpay order for a registration fee. Runs the same
+    // pre-checks register_team() itself enforces (via
+    // precheck_paid_registration, forwarding the caller's own session)
+    // BEFORE ever creating an order or taking a card number, so nobody
+    // pays for a slot that was already gone.
+    router.post('/payments/create-order', requireUserToken, async (req, res) => {
+        if (!razorpayConfigured()) {
+            return res.status(500).json({ error: 'Payments are not configured on the bot yet.' });
+        }
+        const { tournamentId, team } = req.body;
+        if (!tournamentId || !team || !team.id || !team.name) {
+            return res.status(400).json({ error: 'Missing tournamentId or team (with id/name) in request body' });
+        }
+
+        const precheck = await callRpc('precheck_paid_registration', { p_tournament_id: tournamentId, p_team_name: team.name }, req.userToken);
+        if (!precheck) {
+            return res.status(401).json({ error: 'Your session could not be verified -- please sign in again.' });
+        }
+        if (!precheck.success) {
+            return res.status(400).json({ error: precheck.message });
+        }
+
+        const order = await razorpayFetch('/orders', {
+            method: 'POST',
+            body: JSON.stringify({
+                amount: precheck.amountPaise,
+                currency: 'INR',
+                receipt: `${tournamentId}-${team.id}`.slice(0, 40),
+                notes: { tournamentId, teamId: team.id }
+            })
+        });
+        if (!order) {
+            return res.status(502).json({ error: 'Could not create the payment order -- please try again.' });
+        }
+
+        const created = await callRpc('create_registration_payment_order', {
+            p_tournament_id: tournamentId,
+            p_razorpay_order_id: order.id,
+            p_team_payload: team
+        }, req.userToken);
+        if (!created) {
+            return res.status(401).json({ error: 'Your session could not be verified -- please sign in again.' });
+        }
+        if (!created.success) {
+            return res.status(400).json({ error: created.message });
+        }
+
+        return res.status(200).json({
+            razorpayOrderId: created.razorpayOrderId,
+            amountPaise: created.amountPaise,
+            keyId: RAZORPAY_KEY_ID,
+            paymentRecordId: created.paymentRecordId
+        });
+    });
+
+    // 3b. Client-side checkout success callback. This is a fast-path
+    // UX nicety, not the only way a registration completes -- the
+    // webhook below (3c) is the authoritative path if the browser
+    // closes before this ever fires. Both call the exact same RPC,
+    // which is safe to call from either (or both, at once) -- see that
+    // RPC's own comment.
+    router.post('/payments/verify-payment', requireUserToken, async (req, res) => {
+        if (!razorpayConfigured()) {
+            return res.status(500).json({ error: 'Payments are not configured on the bot yet.' });
+        }
+        const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body;
+        if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+            return res.status(400).json({ error: 'Missing payment verification fields.' });
+        }
+
+        // Razorpay's documented checkout-signature algorithm -- HMAC
+        // over the parsed order_id + "|" + payment_id, a DIFFERENT
+        // signature from the webhook's (which is over the raw body).
+        // Fail closed: any mismatch or thrown error rejects, never
+        // proceeds on ambiguity.
+        let expected;
+        try {
+            expected = crypto.createHmac('sha256', RAZORPAY_KEY_SECRET)
+                .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+                .digest('hex');
+        } catch (err) {
+            console.error('[Razorpay] verify-payment HMAC computation failed:', err.message);
+            return res.status(400).json({ error: 'Could not verify this payment.' });
+        }
+        if (!safeKeysMatch(razorpaySignature, expected)) {
+            return res.status(401).json({ error: 'Payment signature does not match.' });
+        }
+
+        const result = await callRpcAsService('complete_registration_payment', {
+            p_razorpay_order_id: razorpayOrderId,
+            p_razorpay_payment_id: razorpayPaymentId
+        });
+        if (!result) {
+            return res.status(500).json({ error: 'Could not complete the registration -- please contact the organizer.' });
+        }
+        if (!result.success) {
+            // create-order's failure branches above already wrap as
+            // {error: message} for _botFetch (js/db.js) to surface -- match
+            // that shape here too so a refund-required/closed message
+            // reaches the client instead of _botFetch's generic "Bot
+            // request failed." fallback (which only fires when `.error`
+            // is absent from a non-2xx body).
+            return res.status(400).json({ error: result.message, ...result });
+        }
+        console.log(`[API] Paid registration completed for order ${razorpayOrderId} -> team ${result.teamId}`);
+        return res.status(200).json(result);
+    });
+
+    // 3c. Razorpay webhook -- the authoritative completion path.
+    // Always 200s once the signature is valid, regardless of what
+    // complete_registration_payment actually did (already-completed is
+    // a valid, expected outcome here, not an error) -- Razorpay retries
+    // on non-200, and retrying an already-idempotent call is harmless
+    // but pointless.
+    router.post('/payments/webhook', verifyRazorpaySignature(() => process.env.RAZORPAY_WEBHOOK_SECRET), async (req, res) => {
+        const event = req.body?.event;
+        if (event !== 'payment.captured') {
+            return res.status(200).json({ ok: true, ignored: event || 'unknown event' });
+        }
+        const payment = req.body?.payload?.payment?.entity;
+        if (!payment?.order_id || !payment?.id) {
+            return res.status(200).json({ ok: true, ignored: 'malformed payload' });
+        }
+
+        const result = await callRpcAsService('complete_registration_payment', {
+            p_razorpay_order_id: payment.order_id,
+            p_razorpay_payment_id: payment.id
+        });
+        if (!result) {
+            // A genuine failure to reach Supabase -- worth a non-200 so
+            // Razorpay retries this one, unlike the "nothing to do"
+            // cases above.
+            return res.status(500).json({ error: 'Could not process webhook.' });
+        }
+        console.log(`[API] Webhook completed order ${payment.order_id}:`, result.success ? (result.alreadyCompleted ? 'already completed' : `team ${result.teamId}`) : result.message);
+        return res.status(200).json({ ok: true });
     });
 
     return router;
