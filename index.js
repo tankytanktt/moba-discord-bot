@@ -103,11 +103,25 @@ app.listen(PORT, () => {
     console.log(`[Express] API Server listening on port ${PORT}`);
 });
 
-// No .catch() here previously meant a failed login (bad/stale token,
-// or a privileged intent requested above -- GuildMembers/MessageContent
-// -- not toggled on in the Developer Portal's Bot page) failed silently:
-// Express stays up and Render reports "Live" forever while the bot
-// itself just never connects, with nothing pointing at why.
+// The .catch() below only covers a clean rejection (bad token, or a
+// privileged intent -- GuildMembers/MessageContent -- not toggled on in
+// the Developer Portal). Observed directly in production: some boots
+// instead stall partway through the Gateway handshake (a network hiccup
+// between Render and Discord) and client.login()'s promise just sits
+// pending forever -- never resolving, never rejecting. That leaves the
+// bot silently offline in Discord indefinitely, with Express/Render
+// seeing nothing wrong since the web server itself never depended on it.
+// This timer is the backstop: if 'ready' hasn't fired within 30s of
+// calling login(), something is stuck, so exit and let Render's own
+// crash-restart give it a fresh attempt instead of hanging forever.
+const LOGIN_TIMEOUT_MS = 30000;
+const loginTimeout = setTimeout(() => {
+    console.error(`[Discord] Login did not complete within ${LOGIN_TIMEOUT_MS / 1000}s -- Gateway handshake appears stuck. Exiting so Render restarts the process.`);
+    process.exit(1);
+}, LOGIN_TIMEOUT_MS);
+client.once('ready', () => clearTimeout(loginTimeout));
+
 client.login(process.env.DISCORD_TOKEN).catch(err => {
+    clearTimeout(loginTimeout);
     console.error('[Discord] Login FAILED -- bot will stay offline in Discord even though this web service stays up. Check: (1) DISCORD_TOKEN in Render\'s Environment tab matches the current token in the Discord Developer Portal\'s Bot page, (2) Server Members Intent and Message Content Intent are both toggled ON there. Raw error:', err);
 });
