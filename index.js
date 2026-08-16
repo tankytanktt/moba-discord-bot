@@ -103,4 +103,11 @@ app.listen(PORT, () => {
     console.log(`[Express] API Server listening on port ${PORT}`);
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// No .catch() here previously meant a failed login (bad/stale token,
+// or a privileged intent requested above -- GuildMembers/MessageContent
+// -- not toggled on in the Developer Portal's Bot page) failed silently:
+// Express stays up and Render reports "Live" forever while the bot
+// itself just never connects, with nothing pointing at why.
+client.login(process.env.DISCORD_TOKEN).catch(err => {
+    console.error('[Discord] Login FAILED -- bot will stay offline in Discord even though this web service stays up. Check: (1) DISCORD_TOKEN in Render\'s Environment tab matches the current token in the Discord Developer Portal\'s Bot page, (2) Server Members Intent and Message Content Intent are both toggled ON there. Raw error:', err);
+});
