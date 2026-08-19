@@ -93,7 +93,7 @@ await describe('discordTime -- schedule formatting', async () => {
         assert.strictEqual(stamps[0], stamps[1]);
     });
 
-    await it('a plain date still parses (used by /tournaments startDate)', () => {
+    await it('a plain date still parses, for callers that want an instant', () => {
         assert.ok(String(discordTime('2026-09-01')).startsWith('<t:'));
     });
 
@@ -104,6 +104,76 @@ await describe('discordTime -- schedule formatting', async () => {
     await it('never throws on a non-string', () => {
         assert.doesNotThrow(function () { discordTime(12345); });
         assert.doesNotThrow(function () { discordTime({}); });
+    });
+});
+
+// ---------------------------------------------------------------
+// discordDate -- a calendar date is not an instant.
+//
+// tournaments."startDate" is a `date` column. Rendering it as a Discord
+// timestamp showed "19 August 2026 05:30 (7 hours ago)" -- a clock time
+// nobody set, a nonsense relative offset, and, for readers west of UTC,
+// the wrong day entirely.
+// ---------------------------------------------------------------
+await describe('discordDate -- plain calendar dates', async () => {
+    const discordDate = require('../src/lib/mspApi').discordDate;
+
+    await it('renders a date as static text', () => {
+        assert.strictEqual(discordDate('2026-08-19'), '19 Aug 2026');
+    });
+
+    await it('emits NO Discord timestamp markup -- that is the whole point', () => {
+        assert.ok(discordDate('2026-08-19').indexOf('<t:') === -1);
+    });
+
+    await it('no invented clock time', () => {
+        assert.ok(!/\d{1,2}:\d{2}/.test(discordDate('2026-08-19')));
+    });
+
+    // The regression that made this more than cosmetic: midnight UTC on the
+    // 19th is still the 18th in the Americas, so the old code showed half
+    // the world the wrong start day.
+    await it('the day never shifts, whatever the reader timezone', () => {
+        const saved = process.env.TZ;
+        const seen = new Set();
+        for (const tz of ['UTC', 'Asia/Kolkata', 'America/Los_Angeles', 'Pacific/Kiritimati']) {
+            process.env.TZ = tz;
+            seen.add(discordDate('2026-08-19'));
+        }
+        if (saved === undefined) delete process.env.TZ; else process.env.TZ = saved;
+        assert.strictEqual(seen.size, 1, 'date drifted across timezones: ' + [...seen].join(' | '));
+        assert.strictEqual([...seen][0], '19 Aug 2026');
+    });
+
+    await it('single-digit days are not zero-padded', () => {
+        assert.strictEqual(discordDate('2026-09-01'), '1 Sep 2026');
+    });
+
+    await it('every month maps to the right name', () => {
+        assert.strictEqual(discordDate('2026-01-15'), '15 Jan 2026');
+        assert.strictEqual(discordDate('2026-12-31'), '31 Dec 2026');
+    });
+
+    await it('a full timestamp is accepted, date part only', () => {
+        assert.strictEqual(discordDate('2026-08-19T18:30:00Z'), '19 Aug 2026');
+    });
+
+    await it('nothing in, null out', () => {
+        assert.strictEqual(discordDate(null), null);
+        assert.strictEqual(discordDate(''), null);
+    });
+
+    await it('unrecognised input falls through rather than vanishing', () => {
+        assert.strictEqual(discordDate('next Tuesday'), 'next Tuesday');
+    });
+
+    await it('an impossible month falls through instead of printing undefined', () => {
+        assert.strictEqual(discordDate('2026-13-01'), '2026-13-01');
+    });
+
+    await it('never throws on a non-string', () => {
+        assert.doesNotThrow(function () { discordDate(12345); });
+        assert.doesNotThrow(function () { discordDate({}); });
     });
 });
 
@@ -246,6 +316,56 @@ await describe('callRpc -- failure is always null, never a throw', async () => {
 });
 
 // ---------------------------------------------------------------
+// Tournament labelling. Both of these shipped wrong once, and neither
+// throws -- they just render nonsense, so only a test catches them.
+// ---------------------------------------------------------------
+await describe('teamFormatLabel / participantNoun', async () => {
+    const { teamFormatLabel, participantNoun } = require('../src/lib/mspApi');
+
+    // The bug: teamSize holds the finished label '1v1', not a number, so
+    // building `${n}v${n}` from it rendered "1v1v1v1" in the embed.
+    await it("'1v1' is passed through, NOT doubled into 1v1v1v1", () => {
+        assert.strictEqual(teamFormatLabel('1v1'), '1v1');
+    });
+
+    await it('blank means "not stated" -- no invented 5v5', () => {
+        assert.strictEqual(teamFormatLabel(''), '');
+        assert.strictEqual(teamFormatLabel(null), '');
+        assert.strictEqual(teamFormatLabel(undefined), '');
+    });
+
+    await it('any other stored label survives intact', () => {
+        assert.strictEqual(teamFormatLabel('5v5'), '5v5');
+        assert.strictEqual(teamFormatLabel(' 3v3 '), '3v3');
+    });
+
+    await it('a 1v1 event counts players, not teams', () => {
+        assert.strictEqual(participantNoun('1v1', true), 'players');
+        assert.strictEqual(participantNoun('1v1', false), 'player');
+    });
+
+    await it('everything else counts teams', () => {
+        assert.strictEqual(participantNoun('5v5', true), 'teams');
+        assert.strictEqual(participantNoun('', true), 'teams');
+        assert.strictEqual(participantNoun(null, true), 'teams');
+    });
+
+    await it('the assembled line reads correctly for a solo event', () => {
+        const t = { game: 'Mobile Legends', teamSize: '1v1', registered: 0, participants: 64 };
+        const fmt = teamFormatLabel(t.teamSize);
+        const line = `${t.game}${fmt ? ' · ' + fmt : ''} · ${t.registered}/${t.participants} ${participantNoun(t.teamSize, true)}`;
+        assert.strictEqual(line, 'Mobile Legends · 1v1 · 0/64 players');
+    });
+
+    await it('and for a standard team event with no size stored', () => {
+        const t = { game: 'Honor of Kings', teamSize: '', registered: 4, participants: 16 };
+        const fmt = teamFormatLabel(t.teamSize);
+        const line = `${t.game}${fmt ? ' · ' + fmt : ''} · ${t.registered}/${t.participants} ${participantNoun(t.teamSize, true)}`;
+        assert.strictEqual(line, 'Honor of Kings · 4/16 teams');
+    });
+});
+
+// ---------------------------------------------------------------
 // SITE_URL -- the links are the fallback when an RPC is unreachable, so a
 // malformed one breaks precisely the path that runs when things go wrong.
 // ---------------------------------------------------------------
@@ -259,11 +379,14 @@ await describe('SITE_URL', async () => {
         assert.strictEqual(require(modPath).SITE_URL, 'https://example.test');
     });
 
-    await it('defaults to production when unset', () => {
+    // Pinned to the exact host, not just "looks like a URL". The default
+    // was mobaesports.netlify.app for one deploy -- a well-formed URL to a
+    // site that is not this one, so every fallback link 404'd.
+    await it('defaults to the real production host when unset', () => {
         delete require.cache[modPath];
         delete process.env.SITE_URL;
         const url = require(modPath).SITE_URL;
-        assert.ok(/^https:\/\/\S+$/.test(url) && url.charAt(url.length - 1) !== '/', 'got: ' + url);
+        assert.strictEqual(url, 'https://mobaesportsplatform.netlify.app');
     });
 
     if (saved === undefined) delete process.env.SITE_URL; else process.env.SITE_URL = saved;

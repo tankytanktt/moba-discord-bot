@@ -20,8 +20,12 @@ app.use(express.json({
 // with no options previously allowed any origin. Requests with no
 // Origin header (health checks, curl, server-to-server) are still let
 // through since they aren't a browser CORS concern.
+// mobaesports.netlify.app was listed here too and has been removed: it is
+// not a site we own. An unclaimed *.netlify.app name can be registered by
+// anyone, and an origin on this list is one a browser is allowed to make
+// credentialed calls from -- so leaving a name we do not control here
+// hands that permission to whoever claims it next.
 const ALLOWED_ORIGINS = [
-    'https://mobaesports.netlify.app',
     'https://mobaesportsplatform.netlify.app',
     'http://localhost:8000'
 ];

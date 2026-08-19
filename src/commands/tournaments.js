@@ -1,5 +1,7 @@
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const { getOpenTournaments, discordTime, SITE_URL } = require('../lib/mspApi');
+const {
+    getOpenTournaments, discordDate, teamFormatLabel, participantNoun, SITE_URL
+} = require('../lib/mspApi');
 
 /**
  * /tournaments -- what is open to register for, right now.
@@ -46,14 +48,18 @@ module.exports = {
             .setTimestamp();
 
         for (const t of rows) {
-            const slots = `${t.registered}/${t.participants} teams`;
+            const fmt = teamFormatLabel(t.teamSize);
+            const format = fmt ? ` · ${fmt}` : '';
+            const slots = `${t.registered}/${t.participants} ${participantNoun(t.teamSize, true)}`;
             const lines = [
-                `${t.game}${t.teamSize ? ` · ${t.teamSize}v${t.teamSize}` : ''} · ${slots}`,
+                `${t.game}${format} · ${slots}`,
                 t.prize ? `🏆 ${t.prize}` : null,
-                // startDate is a plain date, so the relative form ("in 3 days")
-                // is the useful half -- the exact clock time is meaningless
-                // for something that has not been scheduled to the hour.
-                t.startDate ? `🗓️ ${discordTime(t.startDate) || t.startDate}` : null,
+                // startDate is a plain date column, so it is shown as static
+                // text. A Discord timestamp would invent a clock time the
+                // organizer never set ("05:30"), tack on a meaningless
+                // relative offset ("7 hours ago"), and show the PREVIOUS day
+                // to anyone reading from west of UTC.
+                t.startDate ? `🗓️ Starts ${discordDate(t.startDate) || t.startDate}` : null,
                 // Say it plainly rather than leaving someone to compare two
                 // numbers and work it out.
                 t.isFull ? '⛔ **Full** — registration is closed in practice' : null,

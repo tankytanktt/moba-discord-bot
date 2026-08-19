@@ -18,7 +18,12 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 // Where to send people for the full picture. Overridable so a staging
 // deploy links to staging rather than production.
-const SITE_URL = (process.env.SITE_URL || 'https://mobaesports.netlify.app').replace(/\/+$/, '');
+//
+// The default MUST be the real production host: every command falls back
+// to a link when an RPC is unreachable, so a wrong default breaks exactly
+// the path that runs when something is already going wrong. It was
+// mobaesports.netlify.app for one deploy -- a guess, and the wrong one.
+const SITE_URL = (process.env.SITE_URL || 'https://mobaesportsplatform.netlify.app').replace(/\/+$/, '');
 
 /**
  * Calls a Postgres function with the service-role key.
@@ -104,4 +109,70 @@ function discordTime(value) {
     return `<t:${unix}:F> (<t:${unix}:R>)`;
 }
 
-module.exports = { callRpc, getMatchesForDiscordUser, getOpenTournaments, getOpenScrims, discordTime, SITE_URL };
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * Formats a plain CALENDAR DATE (tournaments."startDate" is a `date`
+ * column, with no time in it).
+ *
+ * Deliberately NOT a Discord timestamp. A date is not an instant, and
+ * pushing one through a timezone conversion goes wrong three ways:
+ *
+ *   1. It invents a clock time. "2026-08-19" became midnight UTC, which
+ *      rendered as "19 August 2026 05:30" for a reader in IST -- a start
+ *      time the organizer never set and cannot change.
+ *   2. The relative half reads as nonsense. A tournament starting today
+ *      showed "(7 hours ago)".
+ *   3. Worst of all, it can show the WRONG DAY. Midnight UTC is still the
+ *      18th for every reader in the Americas.
+ *
+ * So this returns static text -- the same date every reader sees, which is
+ * what a calendar date means. discordTime() stays the right tool for real
+ * timestamps (match kickoff, scrim slots), where per-viewer local time is
+ * genuinely the useful thing.
+ */
+function discordDate(value) {
+    if (!value) return null;
+    const s = String(value);
+    // Parsed by hand rather than via Date, so no timezone is ever applied.
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+    if (!m) return s;
+    const month = MONTHS[Number(m[2]) - 1];
+    if (!month) return s;
+    return `${Number(m[3])} ${month} ${m[1]}`;
+}
+
+/**
+ * The tournament's format, as a label.
+ *
+ * tournaments."teamSize" is a text column holding a COMPLETE label -- the
+ * create form stores the literal string '1v1', or leaves it blank for a
+ * standard team roster. It is not a number. Composing `${n}v${n}` from it
+ * shipped "1v1v1v1" to Discord.
+ *
+ * Blank returns '' rather than assuming '5v5': the column is free text and
+ * inventing a value for it would be a guess of the same kind.
+ */
+function teamFormatLabel(teamSize) {
+    const s = (teamSize == null ? '' : String(teamSize)).trim();
+    return s;
+}
+
+/**
+ * 'players' for a solo event, 'teams' otherwise.
+ *
+ * A 1v1 tournament has no teams in it, and "0/64 teams" reads as a bug to
+ * someone signing up alone. Mirrors participantNoun() in the website's
+ * js/views-core.js -- the two must agree, since a player sees both.
+ */
+function participantNoun(teamSize, plural) {
+    const solo = String(teamSize == null ? '' : teamSize).trim() === '1v1';
+    if (plural) return solo ? 'players' : 'teams';
+    return solo ? 'player' : 'team';
+}
+
+module.exports = {
+    callRpc, getMatchesForDiscordUser, getOpenTournaments, getOpenScrims,
+    discordTime, discordDate, teamFormatLabel, participantNoun, SITE_URL
+};
