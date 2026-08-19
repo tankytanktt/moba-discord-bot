@@ -756,18 +756,131 @@ module.exports = (client) => {
             return res.status(200).json({ ok: true, ignored: 'malformed payload' });
         }
 
-        const result = await callRpcAsService('complete_registration_payment', {
+        // One webhook endpoint now serves two products: tournament
+        // registrations and Organizer Pro purchases. Razorpay doesn't tell
+        // us which, so the order id is resolved against each table in
+        // turn. Registration is tried first only because it's the higher
+        // volume path -- both RPCs return "Unknown order." for an id they
+        // don't own, which is the signal to try the other, and both are
+        // independently idempotent so a retry can't double-apply either.
+        let result = await callRpcAsService('complete_registration_payment', {
             p_razorpay_order_id: payment.order_id,
             p_razorpay_payment_id: payment.id
         });
+        let kind = 'registration';
+        if (result && !result.success && /unknown order/i.test(result.message || '')) {
+            result = await callRpcAsService('complete_plan_purchase', {
+                p_razorpay_order_id: payment.order_id,
+                p_razorpay_payment_id: payment.id
+            });
+            kind = 'plan';
+        }
         if (!result) {
             // A genuine failure to reach Supabase -- worth a non-200 so
             // Razorpay retries this one, unlike the "nothing to do"
             // cases above.
             return res.status(500).json({ error: 'Could not process webhook.' });
         }
-        console.log(`[API] Webhook completed order ${payment.order_id}:`, result.success ? (result.alreadyCompleted ? 'already completed' : `team ${result.teamId}`) : result.message);
+        console.log(`[API] Webhook (${kind}) order ${payment.order_id}:`, result.success ? (result.alreadyCompleted || result.alreadyProcessed ? 'already completed' : (result.teamId ? `team ${result.teamId}` : `pro until ${result.proUntil}`)) : result.message);
         return res.status(200).json({ ok: true });
+    });
+
+    // ── 4. Organizer Pro ────────────────────────────────────────
+    // Same two-step shape as the registration routes above (order here,
+    // verify below) and the same signature algorithms. What differs is
+    // only the product: create_plan_order reads the price from
+    // plan_limits itself, so nothing about the amount comes from the
+    // client, and complete_plan_purchase extends users.proUntil rather
+    // than creating a team.
+    router.post('/plan/create-order', requireUserToken, async (req, res) => {
+        if (!razorpayConfigured()) {
+            return res.status(500).json({ error: 'Payments are not configured on the bot yet.' });
+        }
+        const { period } = req.body;
+        if (period !== 'monthly' && period !== 'yearly') {
+            return res.status(400).json({ error: 'period must be "monthly" or "yearly".' });
+        }
+
+        // Razorpay needs an amount before it will mint an order id, and
+        // the only trustworthy source of that amount is the database --
+        // so the price is read server-side here, never taken from the
+        // request body. create_plan_order below independently re-derives
+        // the same price for the stored record rather than trusting this
+        // one, so a tampered bot request still can't buy a year cheap.
+        const price = await callRpc('get_pro_price', { p_period: period }, req.userToken);
+        if (price === null || price === undefined) {
+            return res.status(401).json({ error: 'Your session could not be verified -- please sign in again.' });
+        }
+        if (!(price > 0)) {
+            return res.status(400).json({ error: 'Pro is not on sale right now.' });
+        }
+
+        const order = await razorpayFetch('/orders', {
+            method: 'POST',
+            body: JSON.stringify({
+                amount: price,
+                currency: 'INR',
+                receipt: `pro-${period}-${Date.now()}`.slice(0, 40),
+                notes: { product: 'organizer_pro', period }
+            })
+        });
+        if (!order) {
+            return res.status(502).json({ error: 'Could not create the payment order -- please try again.' });
+        }
+
+        const created = await callRpc('create_plan_order', {
+            p_period: period,
+            p_razorpay_order_id: order.id
+        }, req.userToken);
+        if (!created) {
+            return res.status(401).json({ error: 'Your session could not be verified -- please sign in again.' });
+        }
+        if (!created.success) {
+            return res.status(400).json({ error: created.message });
+        }
+
+        return res.status(200).json({
+            razorpayOrderId: order.id,
+            amountPaise: created.amountPaise,
+            keyId: RAZORPAY_KEY_ID
+        });
+    });
+
+    router.post('/plan/verify-payment', requireUserToken, async (req, res) => {
+        if (!razorpayConfigured()) {
+            return res.status(500).json({ error: 'Payments are not configured on the bot yet.' });
+        }
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+            return res.status(400).json({ error: 'Missing payment verification fields.' });
+        }
+
+        // Identical fail-closed HMAC check to /payments/verify-payment.
+        let expected;
+        try {
+            expected = crypto.createHmac('sha256', RAZORPAY_KEY_SECRET)
+                .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+                .digest('hex');
+        } catch (err) {
+            console.error('[Razorpay] plan verify HMAC computation failed:', err.message);
+            return res.status(400).json({ error: 'Could not verify this payment.' });
+        }
+        if (!safeKeysMatch(razorpay_signature, expected)) {
+            return res.status(401).json({ error: 'Payment signature does not match.' });
+        }
+
+        const result = await callRpcAsService('complete_plan_purchase', {
+            p_razorpay_order_id: razorpay_order_id,
+            p_razorpay_payment_id: razorpay_payment_id
+        });
+        if (!result) {
+            return res.status(500).json({ error: 'Could not complete the upgrade -- please contact support.' });
+        }
+        if (!result.success) {
+            return res.status(400).json({ error: result.message, ...result });
+        }
+        console.log(`[API] Pro purchase completed for order ${razorpay_order_id} -> proUntil ${result.proUntil}`);
+        return res.status(200).json(result);
     });
 
     return router;

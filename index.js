@@ -32,9 +32,44 @@ app.use(cors({
     }
 }));
 
-// Root route for UptimeRobot health checks
+// Health checks, for UptimeRobot (or any pinger) to hit.
+//
+// The old version always returned 200 as long as Express was listening --
+// but Express and the Discord gateway are two independent things. The bot
+// can be perfectly reachable over HTTP while its gateway connection is
+// dead, in which case every slash command fails and every DM silently goes
+// nowhere. A monitor watching that endpoint would have reported "up" the
+// whole time.
+//
+// So the status now reflects what actually matters: is the bot logged in
+// to Discord? A non-2xx is what makes an uptime monitor alert, so a dead
+// gateway has to be a non-2xx or the check is decorative.
+//
+// isReady() is discord.js's own readiness flag; ws.status 0 is READY.
+const gatewayUp = () => {
+    try { return client.isReady() && client.ws.status === 0; }
+    catch (e) { return false; }
+};
+
 app.get('/', (req, res) => {
+    if (!gatewayUp()) {
+        return res.status(503).send('MSP Bot is up but NOT connected to Discord.');
+    }
     res.status(200).send('MSP Bot is online!');
+});
+
+// Same signal, machine-readable, for debugging a flaky deploy.
+app.get('/health', (req, res) => {
+    const up = gatewayUp();
+    res.status(up ? 200 : 503).json({
+        ok: up,
+        discord: up ? 'connected' : 'disconnected',
+        // ws.ping is -1 until the first heartbeat completes.
+        wsPingMs: (() => { try { return client.ws.ping; } catch (e) { return null; } })(),
+        guilds: (() => { try { return client.guilds.cache.size; } catch (e) { return null; } })(),
+        uptimeSeconds: Math.round(process.uptime()),
+        commandsLoaded: (() => { try { return client.commands.size; } catch (e) { return null; } })()
+    });
 });
 
 const PORT = process.env.PORT || 3000;
@@ -44,7 +79,14 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
+        // MessageContent was requested here but never used: there is no
+        // messageCreate handler and nothing reads message.content anywhere
+        // in this bot. It is a PRIVILEGED intent -- it needs Discord's
+        // approval once the bot passes 100 servers, and while enabled it
+        // grants the ability to read every message in every server the bot
+        // is in. Dropping it removes both the future approval hurdle and
+        // the blast radius, and changes no behaviour.
+        //
         // Needed for the username-based member search in
         // /api/verify-membership (apiRouter.js) -- also requires the
         // "Server Members Intent" toggle enabled on the Discord
