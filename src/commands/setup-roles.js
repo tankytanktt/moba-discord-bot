@@ -27,11 +27,14 @@ module.exports = {
                     .setDescription('Get HoK Lane Roles')
                     .setValue('hok')
                     .setEmoji('👑'),
-                new StringSelectMenuOptionBuilder()
-                    .setLabel('LOL Wild Rift')
-                    .setDescription('Get Wild Rift Lane Roles')
-                    .setValue('wildrift')
-                    .setEmoji('🐉'),
+                // Wild Rift is not released in India yet -- no point handing
+                // out lane roles for a game nobody can queue into. Restore
+                // when it launches (js/views-core.js carries the same flag).
+                // new StringSelectMenuOptionBuilder()
+                //     .setLabel('LOL Wild Rift')
+                //     .setDescription('Get Wild Rift Lane Roles')
+                //     .setValue('wildrift')
+                //     .setEmoji('🐉'),
             );
 
         const row = new ActionRowBuilder()

@@ -21,8 +21,12 @@ module.exports = {
                 .setRequired(false)
                 .addChoices(
                     { name: 'Mobile Legends', value: 'Mobile Legends' },
-                    { name: 'Honor of Kings', value: 'Honor of Kings' },
-                    { name: 'LOL Wild Rift', value: 'Wild Rift' }
+                    { name: 'Honor of Kings', value: 'Honor of Kings' }
+                    // Wild Rift is not released in India yet, so it is not
+                    // offered anywhere -- same rule as the website's
+                    // comingSoon flag in js/views-core.js. Restore this line
+                    // when the game launches.
+                    // { name: 'LOL Wild Rift', value: 'Wild Rift' }
                 ))
         .addBooleanOption(option =>
             option.setName('private')

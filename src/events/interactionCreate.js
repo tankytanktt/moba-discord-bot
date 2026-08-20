@@ -44,6 +44,10 @@ module.exports = {
                         { id: 'default_Marksman', label: 'Marksman', emoji: '🏹' },
                         { id: 'default_Roam', label: 'Roam', emoji: '❤️' }
                     ];
+                // Currently unreachable: the Wild Rift option is commented
+                // out in setup-roles.js until the game launches in India.
+                // Kept deliberately so restoring it is a one-line change --
+                // this is dormant, not dead.
                 } else if (game === 'wildrift') {
                     embed.setTitle('Wild Rift Roles')
                         .setDescription('Select your Wild Rift lanes:');
