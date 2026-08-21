@@ -87,6 +87,11 @@ function getOpenTournaments(limit = 8) {
     return callRpc('get_open_tournaments_for_bot', { p_limit: limit });
 }
 
+/** Active partnered creators, in the site's own display order. */
+function getPartners(limit = 25) {
+    return callRpc('get_partners_for_bot', { p_limit: limit });
+}
+
 /** Open scrims, optionally narrowed to one game. */
 function getOpenScrims(game = null, limit = 8) {
     return callRpc('get_open_scrims_for_bot', { p_game: game, p_limit: limit });
@@ -173,6 +178,6 @@ function participantNoun(teamSize, plural) {
 }
 
 module.exports = {
-    callRpc, getMatchesForDiscordUser, getOpenTournaments, getOpenScrims,
+    callRpc, getMatchesForDiscordUser, getOpenTournaments, getOpenScrims, getPartners,
     discordTime, discordDate, teamFormatLabel, participantNoun, SITE_URL
 };
