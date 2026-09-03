@@ -393,6 +393,350 @@ await describe('SITE_URL', async () => {
     delete require.cache[modPath];
 });
 
+// ---------------------------------------------------------------
+// The scheduler. Every test drives runDue() directly with an injected
+// clock -- no real timers, so the suite stays instant and deterministic.
+// ---------------------------------------------------------------
+await describe('scheduler -- runs work on time without stacking or dying', async () => {
+    const { createScheduler } = require(path.join(__dirname, '..', 'src', 'lib', 'scheduler'));
+    const quiet = () => {};
+    const clock = (start) => { let t = start; return { now: () => t, advance: (ms) => { t += ms; } }; };
+
+    await it('does not run a job before it is due', async () => {
+        const c = clock(0);
+        let runs = 0;
+        const s = createScheduler({ now: c.now, log: quiet });
+        s.register({ name: 'a', everyMs: 1000, run: async () => { runs++; } });
+        await s.runDue();
+        assert.strictEqual(runs, 0, 'ran early');
+        c.advance(999);
+        await s.runDue();
+        assert.strictEqual(runs, 0, 'ran one tick early');
+        c.advance(1);
+        await s.runDue();
+        assert.strictEqual(runs, 1);
+    });
+
+    await it('the first run waits a full interval rather than firing at boot', async () => {
+        const c = clock(0);
+        let runs = 0;
+        const s = createScheduler({ now: c.now, log: quiet });
+        s.register({ name: 'a', everyMs: 5000, run: async () => { runs++; } });
+        await s.runDue();
+        // Startup is this process's least stable moment -- gateway
+        // handshake, command registration -- and a sweep fired into it has
+        // the worst chance of succeeding.
+        assert.strictEqual(runs, 0);
+    });
+
+    await it('one job throwing does not stop the others', async () => {
+        const c = clock(0);
+        let good = 0;
+        const s = createScheduler({ now: c.now, log: quiet });
+        s.register({ name: 'bad', everyMs: 1000, run: async () => { throw new Error('boom'); } });
+        s.register({ name: 'good', everyMs: 1000, run: async () => { good++; } });
+        c.advance(1000);
+        await s.runDue();
+        assert.strictEqual(good, 1, 'the healthy job was skipped because a sibling threw');
+        const st = s.status();
+        assert.strictEqual(st.jobs[0].failures, 1);
+        assert.strictEqual(st.jobs[0].lastError, 'boom');
+        assert.strictEqual(st.jobs[1].failures, 0);
+    });
+
+    await it('a throwing job never rejects out of runDue', async () => {
+        // An unhandled rejection here would take the whole bot down --
+        // Discord connection included -- which has happened to this
+        // process before via a different route.
+        const c = clock(0);
+        const s = createScheduler({ now: c.now, log: quiet });
+        s.register({ name: 'bad', everyMs: 1000, run: async () => { throw new Error('boom'); } });
+        c.advance(1000);
+        await s.runDue();
+    });
+
+    await it('does not stack a job that is still running', async () => {
+        const c = clock(0);
+        let started = 0, release;
+        const s = createScheduler({ now: c.now, log: quiet });
+        s.register({
+            name: 'slow', everyMs: 1000,
+            run: () => { started++; return new Promise(r => { release = r; }); }
+        });
+        c.advance(1000);
+        const first = s.runDue();
+        c.advance(1000);
+        // Raced against a timeout on purpose. Without the overlap guard
+        // this second pass starts the job again and awaits a promise
+        // nothing will ever resolve -- which would hang the whole suite
+        // instead of failing this one test, and take every check after it
+        // down with it.
+        const settled = await Promise.race([
+            s.runDue().then(() => 'done'),
+            new Promise(r => setTimeout(() => r('hung'), 200))
+        ]);
+        assert.strictEqual(settled, 'done', 'runDue never returned -- the overlap guard is gone');
+        assert.strictEqual(started, 1, 'a second copy started while the first was in flight');
+        assert.strictEqual(s.status().jobs[0].skips, 1, 'the skip was not recorded');
+        release();
+        await first;
+    });
+
+    await it('an enabled() gate skips without counting as a failure', async () => {
+        const c = clock(0);
+        let runs = 0, up = false;
+        const s = createScheduler({ now: c.now, log: quiet });
+        s.register({ name: 'gated', everyMs: 1000, enabled: () => up, run: async () => { runs++; } });
+        c.advance(1000);
+        await s.runDue();
+        assert.strictEqual(runs, 0);
+        assert.strictEqual(s.status().jobs[0].failures, 0, 'a skip was recorded as a failure');
+        assert.strictEqual(s.status().jobs[0].skips, 1);
+        up = true;
+        c.advance(1000);
+        await s.runDue();
+        assert.strictEqual(runs, 1);
+    });
+
+    await it('reschedules from the END of a run, so a slow job cannot be permanently due', async () => {
+        const c = clock(0);
+        let runs = 0;
+        const s = createScheduler({ now: c.now, log: quiet });
+        s.register({ name: 'slow', everyMs: 1000, run: async () => { runs++; c.advance(5000); } });
+        c.advance(1000);
+        await s.runDue();
+        assert.strictEqual(runs, 1);
+        await s.runDue();
+        assert.strictEqual(runs, 1, 'a slow job re-fired immediately instead of waiting its interval');
+    });
+
+    await it('refuses two jobs with the same name', async () => {
+        const s = createScheduler({ now: () => 0, log: quiet });
+        s.register({ name: 'a', everyMs: 1000, run: async () => {} });
+        assert.throws(() => s.register({ name: 'a', everyMs: 1000, run: async () => {} }), /duplicate/);
+    });
+
+    await it('rejects a malformed job rather than registering something that cannot run', async () => {
+        const s = createScheduler({ now: () => 0, log: quiet });
+        assert.throws(() => s.register({ name: 'x' }), /needs/);
+        assert.throws(() => s.register(null), /needs/);
+    });
+
+    await it('reports a stalled job -- the failure mode nobody noticed last time', async () => {
+        const c = clock(0);
+        const s = createScheduler({ now: c.now, log: quiet });
+        s.register({ name: 'a', everyMs: 1000, run: async () => {} });
+        s.start(100000);
+        c.advance(1000);
+        await s.runDue();
+        assert.strictEqual(s.status().jobs[0].stalled, false);
+        c.advance(3001);
+        assert.strictEqual(s.status().jobs[0].stalled, true,
+            'a timer that stopped firing must be visible from /health');
+        s.stop();
+    });
+
+    await it('keeps only small scalar values in the status payload', async () => {
+        // /health is read by an uptime monitor, not a debugger -- a job's
+        // return value must not become a data leak.
+        const c = clock(0);
+        const s = createScheduler({ now: c.now, log: quiet });
+        s.register({
+            name: 'a', everyMs: 1000,
+            run: async () => ({ scrims: 2, secret: { token: 'abc' }, note: 'x'.repeat(500) })
+        });
+        c.advance(1000);
+        await s.runDue();
+        const r = s.status().jobs[0].lastResult;
+        assert.strictEqual(r.scrims, 2);
+        assert.strictEqual(r.secret, undefined, 'a nested object reached the health payload');
+        assert.ok(r.note.length <= 80, 'a long string was not truncated');
+    });
+
+    await it('truncates an error message and never exposes a stack', async () => {
+        const c = clock(0);
+        const s = createScheduler({ now: c.now, log: quiet });
+        s.register({ name: 'a', everyMs: 1000, run: async () => { throw new Error('y'.repeat(500)); } });
+        c.advance(1000);
+        await s.runDue();
+        const err = s.status().jobs[0].lastError;
+        assert.ok(err.length <= 200);
+        assert.ok(err.indexOf('at ') === -1, 'a stack frame leaked into the status payload');
+    });
+});
+
+// ---------------------------------------------------------------
+// The scrim reminder sweep itself -- fully injected, so none of this
+// touches Discord or Supabase.
+// ---------------------------------------------------------------
+await describe('scrim reminders -- the sweep that had nowhere to run', async () => {
+    const { createScrimReminderJob, formatWhen } =
+        require(path.join(__dirname, '..', 'src', 'jobs', 'scrimReminders'));
+    const quiet = () => {};
+
+    const scrim = (id) => ({
+        id: id, creatorOwnerId: 'u1', opponentOwnerId: 'u2',
+        scheduledAt: '2026-09-04T14:30:00Z'
+    });
+
+    function harness(overrides) {
+        const o = overrides || {};
+        const calls = [];
+        const dms = [];
+        // One interleaved log across both dependencies. Two separate
+        // arrays cannot answer "did the DM happen before the mark?", which
+        // is the ordering the whole retry story depends on.
+        const events = [];
+        const job = createScrimReminderJob({
+            log: quiet,
+            gatewayUp: o.gatewayUp !== undefined ? o.gatewayUp : (() => true),
+            callRpc: async (name, args) => {
+                calls.push({ name: name, args: args });
+                events.push(name === 'mark_scrim_reminder_sent' ? 'mark:' + args.p_scrim_id : 'rpc:' + name);
+                if (name === 'get_scrims_needing_reminder') {
+                    return o.scrims === undefined ? [] : o.scrims;
+                }
+                return o.markFails ? null : {};
+            },
+            dmUser: async (id, text) => {
+                dms.push({ id: id, text: text });
+                events.push('dm:' + id);
+                return { ok: !o.dmFails };
+            }
+        });
+        return { job: job, calls: calls, dms: dms, events: events };
+    }
+
+    await it('does nothing at all while Discord is disconnected', async () => {
+        // THE bug this guard exists for: the original endpoint marked
+        // every scrim as reminded even when every DM had failed, turning
+        // a temporary outage into permanently missed reminders.
+        const h = harness({ gatewayUp: () => false, scrims: [scrim('S-1')] });
+        const r = await h.job.run();
+        assert.strictEqual(r.skipped, 'discord-disconnected');
+        assert.strictEqual(h.calls.length, 0, 'it queried Supabase with no way to deliver');
+        assert.strictEqual(h.dms.length, 0);
+    });
+
+    await it('reports an unreachable Supabase without throwing', async () => {
+        const h = harness({ scrims: null });
+        const r = await h.job.run();
+        assert.strictEqual(r.error, 'supabase-unreachable');
+        assert.strictEqual(h.dms.length, 0);
+    });
+
+    await it('is a quiet no-op when nothing is due', async () => {
+        const h = harness({ scrims: [] });
+        const r = await h.job.run();
+        assert.deepStrictEqual(r, { scrims: 0, dms: 0 });
+        assert.strictEqual(h.calls.length, 1, 'it did more than the one query');
+    });
+
+    await it('DMs both squad owners and then marks the scrim', async () => {
+        const h = harness({ scrims: [scrim('S-1')] });
+        const r = await h.job.run();
+        assert.strictEqual(r.dms, 2);
+        assert.deepStrictEqual(h.dms.map(d => d.id), ['u1', 'u2']);
+        const marks = h.calls.filter(c => c.name === 'mark_scrim_reminder_sent');
+        assert.strictEqual(marks.length, 1);
+        assert.strictEqual(marks[0].args.p_scrim_id, 'S-1');
+    });
+
+    await it('marks AFTER sending, never before', async () => {
+        // Marking first turns a failed send into a silent permanent miss.
+        // This order turns it into a duplicate at worst.
+        const h = harness({ scrims: [scrim('S-1')] });
+        await h.job.run();
+        assert.deepStrictEqual(h.events,
+            ['rpc:get_scrims_needing_reminder', 'dm:u1', 'dm:u2', 'mark:S-1'],
+            'the sweep did not query, then send, then mark -- in that order');
+    });
+
+    await it('still marks when a DM bounces, since that is a permanent condition', async () => {
+        // The gateway is up, so a failure here means DMs are closed or the
+        // player left -- retrying every five minutes helps nobody.
+        const h = harness({ scrims: [scrim('S-1')], dmFails: true });
+        const r = await h.job.run();
+        assert.strictEqual(r.dms, 0);
+        assert.strictEqual(r.failed, 2);
+        assert.strictEqual(r.marked, 1);
+    });
+
+    await it('leaves the scrim unmarked when the mark itself fails, so the next tick retries', async () => {
+        const h = harness({ scrims: [scrim('S-1')], markFails: true });
+        const r = await h.job.run();
+        assert.strictEqual(r.marked, 0);
+    });
+
+    await it('skips a missing owner id instead of DMing undefined', async () => {
+        const h = harness({ scrims: [{ id: 'S-1', creatorOwnerId: 'u1', opponentOwnerId: null,
+                                       scheduledAt: '2026-09-04T14:30:00Z' }] });
+        const r = await h.job.run();
+        assert.strictEqual(r.dms, 1);
+        assert.deepStrictEqual(h.dms.map(d => d.id), ['u1']);
+    });
+
+    await it('handles several scrims in one sweep', async () => {
+        const h = harness({ scrims: [scrim('S-1'), scrim('S-2')] });
+        const r = await h.job.run();
+        assert.strictEqual(r.scrims, 2);
+        assert.strictEqual(r.dms, 4);
+        assert.strictEqual(h.calls.filter(c => c.name === 'mark_scrim_reminder_sent').length, 2);
+    });
+
+    await it('puts a readable IST time in the message, not a raw UTC stamp', async () => {
+        const h = harness({ scrims: [scrim('S-1')] });
+        await h.job.run();
+        const text = h.dms[0].text;
+        assert.ok(text.indexOf('IST') !== -1, 'no timezone the reader can act on: ' + text);
+        assert.ok(text.indexOf('2026-09-04T14:30:00Z') === -1, 'the raw stamp leaked into the DM');
+    });
+
+    await it('never throws on a missing or malformed time', async () => {
+        assert.strictEqual(formatWhen(null), 'soon');
+        assert.strictEqual(formatWhen(''), 'soon');
+        assert.strictEqual(formatWhen('not a date'), 'soon');
+    });
+});
+
+// ---------------------------------------------------------------
+// Wiring. The point of this feature is that something actually calls
+// the sweep -- the SQL, the endpoint and the idempotency all existed
+// already and sat dead for want of a caller.
+// ---------------------------------------------------------------
+await describe('scheduler wiring -- the sweep has a caller', async () => {
+    const root = path.join(__dirname, '..');
+    const index = fs.readFileSync(path.join(root, 'index.js'), 'utf8');
+    const router = fs.readFileSync(path.join(root, 'src', 'api', 'apiRouter.js'), 'utf8');
+
+    await it('the bot registers the scrim sweep on its own timer', async () => {
+        assert.ok(/createScheduler\(\)/.test(index), 'no scheduler is built');
+        assert.ok(/name: 'scrim-reminders'/.test(index), 'the sweep is not registered');
+    });
+
+    await it('and starts it only once Discord is connected', async () => {
+        assert.ok(/client\.once\('ready'[\s\S]{0,700}scheduler\.start/.test(index),
+            'the timer starts before the gateway is up');
+    });
+
+    await it('a stalled timer is visible on /health', async () => {
+        assert.ok(/scheduler: \(\(\) => \{ try \{ return scheduler\.status\(\)/.test(index),
+            'nothing reports the scheduler state -- the exact gap that hid the last failure');
+    });
+
+    await it('the endpoint and the timer share one implementation', async () => {
+        assert.ok(/createScrimReminderJob/.test(router), 'the route does not use the shared job');
+        assert.ok(/scrimReminderJob\.run\(\)/.test(router), 'the route still has its own copy of the loop');
+        assert.ok(!/get_scrims_needing_reminder', \{\}\);[\s\S]{0,40}if \(!scrims\)/.test(router),
+            'the original inline sweep is still in the route');
+    });
+
+    await it('the bot does not HTTP-call itself to reach its own function', async () => {
+        assert.ok(!/fetch\([^)]*scrim-reminders-tick/.test(index),
+            'the scheduler goes back out over the network to reach code in this process');
+    });
+});
+
 console.log('\n' + '='.repeat(60));
 console.log(passed + ' passed, ' + failed + ' failed');
 console.log('='.repeat(60));

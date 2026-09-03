@@ -1,6 +1,6 @@
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const {
-    getOpenTournaments, discordDate, teamFormatLabel, participantNoun, SITE_URL
+    getOpenTournaments, discordDate, teamFormatLabel, participantNoun, prizeLine, SITE_URL
 } = require('../lib/mspApi');
 
 /**
@@ -53,7 +53,7 @@ module.exports = {
             const slots = `${t.registered}/${t.participants} ${participantNoun(t.teamSize, true)}`;
             const lines = [
                 `${t.game}${format} · ${slots}`,
-                t.prize ? `🏆 ${t.prize}` : null,
+                (() => { const p = prizeLine(t); return p ? `🏆 ${p}` : null; })(),
                 // startDate is a plain date column, so it is shown as static
                 // text. A Discord timestamp would invent a clock time the
                 // organizer never set ("05:30"), tack on a meaningless

@@ -177,7 +177,28 @@ function participantNoun(teamSize, plural) {
     return solo ? 'player' : 'team';
 }
 
+// Prize, as the site now stores it: a number in paise plus a free-text
+// note. Mirrors prizeParts()/formatRupees() in js/views-core.js -- the
+// bot cannot import them (separate process, no classic scripts), the
+// same reason teamFormatLabel lives here twice.
+//
+// A tournament from before the amount column has no figure, and its
+// free text comes back unchanged, so old rows read exactly as they did.
+function prizeLine(t) {
+    const paise = t && typeof t.prizeAmountPaise === 'number' ? t.prizeAmountPaise : null;
+    const note = String((t && t.prize) || '').trim();
+    if (paise === null) return note;
+    // Indian grouping: 5,000 but 1,00,000.
+    const digits = String(Math.floor(Math.round(paise) / 100));
+    let grouped = digits.slice(-3);
+    let rest = digits.slice(0, -3);
+    while (rest.length > 2) { grouped = rest.slice(-2) + ',' + grouped; rest = rest.slice(0, -2); }
+    if (rest) grouped = rest + ',' + grouped;
+    const amount = '₹' + grouped;
+    return note ? amount + ' · ' + note : amount;
+}
+
 module.exports = {
     callRpc, getMatchesForDiscordUser, getOpenTournaments, getOpenScrims, getPartners,
-    discordTime, discordDate, teamFormatLabel, participantNoun, SITE_URL
+    discordTime, discordDate, teamFormatLabel, participantNoun, prizeLine, SITE_URL
 };

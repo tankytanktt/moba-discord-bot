@@ -4,6 +4,8 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const { createScheduler } = require('./src/lib/scheduler');
+const { createScrimReminderJob } = require('./src/jobs/scrimReminders');
 
 // --- 1. Set up Express API Server ---
 const app = express();
@@ -72,7 +74,12 @@ app.get('/health', (req, res) => {
         wsPingMs: (() => { try { return client.ws.ping; } catch (e) { return null; } })(),
         guilds: (() => { try { return client.guilds.cache.size; } catch (e) { return null; } })(),
         uptimeSeconds: Math.round(process.uptime()),
-        commandsLoaded: (() => { try { return client.commands.size; } catch (e) { return null; } })()
+        commandsLoaded: (() => { try { return client.commands.size; } catch (e) { return null; } })(),
+        // The whole reason the first attempt at scheduling went unnoticed
+        // for weeks is that nothing reported it was under-firing. A
+        // monitor can watch `scheduler.jobs[].stalled` and see a dead
+        // timer without anyone reading a log.
+        scheduler: (() => { try { return scheduler.status(); } catch (e) { return null; } })()
     });
 });
 
@@ -130,8 +137,33 @@ for (const file of eventFiles) {
 
 // --- 4. Load API Routes ---
 // We pass the discord client to our modular router so the API can use it
-const apiRouter = require('./src/api/apiRouter')(client);
+const apiRouterModule = require('./src/api/apiRouter');
+const apiRouter = apiRouterModule(client);
 app.use('/api', apiRouter);
+
+// --- 4.5 The scheduler ---
+// Until now nothing on this platform happened on a schedule. The scrim
+// reminder had its SQL, its endpoint and its idempotency, and was driven
+// by a GitHub Actions cron that fired every 3-4 hours instead of every 5
+// minutes -- GitHub deprioritizes schedules on quiet repositories -- so
+// the trigger was removed and the feature went dead.
+//
+// This process is already awake (Render, kept warm by an uptime pinger
+// hitting /health). A timer here fires when it says it will, needs no new
+// service, and survives a restart because every job is idempotent.
+const scheduler = createScheduler();
+scheduler.register({
+    name: 'scrim-reminders',
+    everyMs: Number(process.env.SCRIM_REMINDER_INTERVAL_MS) || 5 * 60 * 1000,
+    // Skipped rather than failed while Discord is down: a DM cannot be
+    // sent, and the job would otherwise mark scrims as reminded anyway.
+    enabled: () => { try { return client.isReady(); } catch (e) { return false; } },
+    run: createScrimReminderJob({
+        callRpc: apiRouterModule.callRpcAsService,
+        dmUser: (userId, text) => apiRouterModule.dmUserById(client, userId, text),
+        gatewayUp: () => { try { return client.isReady(); } catch (e) { return false; } }
+    }).run
+});
 
 // Catch-all error handler -- must be registered last, and must keep all
 // 4 arguments for Express to recognize it as an error handler rather
@@ -165,7 +197,17 @@ const loginTimeout = setTimeout(() => {
     console.error(`[Discord] Login did not complete within ${LOGIN_TIMEOUT_MS / 1000}s -- Gateway handshake appears stuck. Exiting so Render restarts the process.`);
     process.exit(1);
 }, LOGIN_TIMEOUT_MS);
-client.once('ready', () => clearTimeout(loginTimeout));
+client.once('ready', () => {
+    clearTimeout(loginTimeout);
+    // Started here, not at boot: every job so far needs the gateway, and
+    // starting the timer before the handshake completes just burns the
+    // first few turns on work that cannot succeed.
+    if (process.env.SCHEDULER_ENABLED === 'false') {
+        console.log('[scheduler] disabled by SCHEDULER_ENABLED=false');
+    } else {
+        scheduler.start(Number(process.env.SCHEDULER_TICK_MS) || 60 * 1000);
+    }
+});
 
 client.login(process.env.DISCORD_TOKEN).catch(err => {
     clearTimeout(loginTimeout);

@@ -1,5 +1,6 @@
 const express = require('express');
 const crypto = require('crypto');
+const { createScrimReminderJob } = require('../jobs/scrimReminders');
 const router = express.Router();
 
 // Plain `!==` leaks timing information (an attacker can narrow down the
@@ -308,6 +309,15 @@ module.exports = (client) => {
         next();
     });
 
+    // Built once per router, with this module's own Supabase and DM
+    // helpers injected. index.js builds an identical one for the timer --
+    // same code, same guarantees, no HTTP hop between them.
+    const scrimReminderJob = createScrimReminderJob({
+        callRpc: callRpcAsService,
+        dmUser: (userId, text) => dmUserById(client, userId, text),
+        gatewayUp: () => { try { return client.isReady(); } catch (e) { return false; } }
+    });
+
     // --- 1. Send DM Notification ---
     router.post('/notify', requireApiKey, rateLimitNotify, async (req, res) => {
         const { userId, message } = req.body;
@@ -378,22 +388,26 @@ module.exports = (client) => {
     // get_scrims_needing_reminder()/mark_scrim_reminder_sent(), both
     // deliberately ungranted to authenticated/anon in supabase_migration_rls.sql
     // section 17 -- this endpoint is the only way either is reachable.
+    // The sweep itself now lives in src/jobs/scrimReminders.js, because
+    // the bot runs it on its own timer (src/lib/scheduler.js) as well as
+    // serving it here. Two copies of this loop would drift, and this one
+    // had a bug the shared version fixes: it marked every scrim as
+    // reminded even when the Discord gateway was down and every DM had
+    // failed, permanently losing reminders that no retry would pick up.
+    //
+    // The endpoint is kept for a manual poke while debugging, and so an
+    // external cron can still drive it. Both paths are idempotent, so
+    // running both changes nothing.
     router.post('/scrim-reminders-tick', requireApiKey, async (req, res) => {
-        const scrims = await callRpcAsService('get_scrims_needing_reminder', {});
-        if (!scrims) {
+        const result = await scrimReminderJob.run();
+        if (result && result.error) {
             return res.status(500).json({ error: 'Could not reach Supabase for the reminder query.' });
         }
-
-        let sent = 0;
-        for (const s of scrims) {
-            for (const ownerId of [s.creatorOwnerId, s.opponentOwnerId]) {
-                const result = await dmUserById(client, ownerId, `Reminder: your scrim starts soon (${s.scheduledAt}).`);
-                if (result.ok) sent++;
-            }
-            await callRpcAsService('mark_scrim_reminder_sent', { p_scrim_id: s.id });
-        }
-        console.log(`[API] Scrim reminder tick: ${scrims.length} scrim(s), ${sent} DM(s) sent`);
-        return res.status(200).json({ ok: true, scrimsProcessed: scrims.length, remindersSent: sent });
+        return res.status(200).json({
+            ok: true,
+            scrimsProcessed: result.scrims || 0,
+            remindersSent: result.dms || 0
+        });
     });
 
     // --- 1b. Notify a batch of players by Discord username ---
@@ -885,3 +899,11 @@ module.exports = (client) => {
 
     return router;
 };
+
+// Exported for index.js, which builds the same scrim-reminder job for
+// the scheduler. Attached to the factory rather than moved to their own
+// module: they are still only meaningful to this bot's Supabase and
+// Discord wiring, and moving them would be a bigger change than the one
+// being made.
+module.exports.dmUserById = dmUserById;
+module.exports.callRpcAsService = callRpcAsService;

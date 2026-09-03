@@ -3,11 +3,28 @@ name: Scrim reminder tick
 # The scheduled trigger below is disabled -- GitHub deprioritizes
 # `schedule:` crons on low-activity repos, and in practice this fired
 # every ~3-4 hours instead of every 5 minutes, so scrims routinely
-# went unreminded. Replaced by a manual "Notify Opponent" button in
-# the scrim lobby (js/views-scrims.js, 'reminder' event on
-# /scrim-notify), which has no scheduling to slip. This workflow is
-# kept only for workflow_dispatch, in case the tick endpoint itself
-# ever needs a manual poke while debugging.
+# went unreminded.
+#
+# The tick now runs INSIDE the bot process instead (src/lib/scheduler.js,
+# started on 'ready' in index.js). That process is already long-lived and
+# already kept awake by the uptime pinger on /health, so a timer there
+# fires when it says it will, with no queue to sit in. Its state is
+# reported under `scheduler` on /health -- worth a monitor, since the
+# thing that made this failure so long-lived was that nothing reported
+# the cron was under-firing.
+#
+# Do NOT re-enable `schedule:` here expecting it to help: a 3-4 hour
+# cron cannot serve a 20-minute reminder window. If you ever want a
+# belt-and-braces external trigger, point a reliable cron service at the
+# same endpoint -- the sweep is idempotent (reminderSentAt), so running
+# both changes nothing.
+#
+# The manual "Notify Opponent" button in the scrim lobby
+# (js/views-scrims.js, 'reminder' event on /scrim-notify) also stays --
+# it is a deliberate action, not a fallback.
+#
+# This workflow is kept for workflow_dispatch, so the endpoint can be
+# poked by hand while debugging.
 on:
   workflow_dispatch: {} # manual trigger only -- see note above
 
