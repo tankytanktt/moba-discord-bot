@@ -97,6 +97,13 @@ function rateLimitNotify(req, res, next) {
 // unlimited either. The real quota protection is the daily lookup budget
 // inside youtube.js; this only keeps one client from monopolising the
 // process.
+// Ceilings on one round trigger. A bracket round cannot legitimately be
+// larger than this, and together they bound what a single organizer
+// click can set in motion -- against a mistake as much as against a
+// tampered request.
+const MAX_ROUND_MATCHES = 32;
+const MAX_ROUND_RECIPIENTS = 400;
+
 const PUBLIC_RATE_LIMIT_MAX = 240;
 const publicRateBucket = { windowStart: 0, count: 0 };
 
@@ -652,6 +659,106 @@ module.exports = (client) => {
             }
         }
 
+        return res.status(200).json({ results });
+    });
+
+    // --- 1h. Notify an entire bracket round, one DM per player about
+    // their OWN match ---
+    //
+    // WHY THIS IS ONE ENDPOINT AND NOT A CLIENT-SIDE LOOP.
+    // rateLimitPerToken caps a session at 5 requests a minute. A round of
+    // eight matches sent as eight calls is refused after the fifth,
+    // leaving half a round notified and the organizer unable to tell
+    // which half. Doing the whole round inside one request also means the
+    // Discord guild is resolved once instead of eight times.
+    //
+    // AUTHORIZATION IS PER MATCH, deliberately. Every match goes through
+    // authorize_match_dm() -- the same RPC the single-match route uses,
+    // scoped to the tournament -- so a tampered request carrying another
+    // tournament's team ids resolves to no usernames rather than DMing
+    // that tournament's players. There is no round-level shortcut that
+    // would skip that check.
+    router.post('/tournament-notify-round', requireUserToken, rateLimitNotify, rateLimitPerToken, async (req, res) => {
+        const { tournamentId, matches } = req.body;
+
+        if (!tournamentId || !Array.isArray(matches) || !matches.length) {
+            return res.status(400).json({ error: 'Missing tournamentId or matches in request body' });
+        }
+        if (matches.length > MAX_ROUND_MATCHES) {
+            return res.status(400).json({
+                error: `A round trigger can cover at most ${MAX_ROUND_MATCHES} matches.`
+            });
+        }
+
+        let guild = null;              // resolved once, on the first authorized match
+        let sentCount = 0;
+        const results = [];
+
+        for (const entry of matches) {
+            const matchId = entry && entry.matchId;
+            const team1Id = entry && entry.team1Id;
+            const team2Id = entry && entry.team2Id;
+            const message = entry && entry.message;
+
+            if (!team1Id || !team2Id || !message) {
+                results.push({ matchId, error: 'Missing team ids or message', results: [] });
+                continue;
+            }
+
+            const auth = await callRpc('authorize_match_dm', {
+                p_tournament_id: tournamentId, p_team1_id: team1Id, p_team2_id: team2Id
+            }, req.userToken);
+
+            if (!auth) {
+                // A failed authorization call is about the SESSION, not this
+                // match -- every remaining match would fail the same way, so
+                // stop rather than hammer the RPC once per match.
+                return res.status(401).json({ error: 'Your session could not be verified -- please sign in again.' });
+            }
+            if (!auth.allowed) {
+                results.push({ matchId, error: auth.message, results: [] });
+                continue;
+            }
+
+            if (!guild) {
+                const resolved = await resolveGuild(client, auth.inviteLink);
+                if (resolved.error) {
+                    return res.status(resolved.status).json({ error: resolved.error });
+                }
+                guild = resolved.guild;
+            }
+
+            const body = String(message).slice(0, 2000);
+            const perMatch = [];
+            for (const username of auth.usernames) {
+                // A global ceiling as well as a per-round one: without it a
+                // single click could set off an unbounded number of DMs and
+                // put the bot in front of Discord's own rate limiter.
+                if (sentCount >= MAX_ROUND_RECIPIENTS) {
+                    perMatch.push({ username, success: false, error: 'Round DM limit reached' });
+                    continue;
+                }
+                try {
+                    const member = await findMemberInGuild(guild, username);
+                    if (!member) {
+                        perMatch.push({ username, success: false, error: 'Not found in server' });
+                        continue;
+                    }
+                    await member.user.send(body);
+                    sentCount++;
+                    perMatch.push({ username, success: true });
+                } catch (error) {
+                    console.error(`[API Error] Round DM to ${username} failed:`, error.message);
+                    perMatch.push({
+                        username, success: false,
+                        error: error.code === 50007 ? 'DMs disabled or blocked' : 'Send failed'
+                    });
+                }
+            }
+            results.push({ matchId, results: perMatch });
+        }
+
+        console.log(`[API] Round notify for ${tournamentId}: ${matches.length} matches, ${sentCount} DMs sent`);
         return res.status(200).json({ results });
     });
 
