@@ -737,6 +737,289 @@ await describe('scheduler wiring -- the sweep has a caller', async () => {
     });
 });
 
+// ---------------------------------------------------------------
+// YouTube subscriber badge.
+// ---------------------------------------------------------------
+await describe('youtube -- channel URLs', async () => {
+    const { parseYouTubeChannel } = require('../src/lib/youtube');
+
+    await it('resolves the two forms the API can answer in one call', () => {
+        assert.deepStrictEqual(parseYouTubeChannel('https://www.youtube.com/@MSPesports'),
+            { type: 'handle', value: 'MSPesports' });
+        assert.deepStrictEqual(parseYouTubeChannel('https://youtube.com/channel/UCabcdefghijklmnopqrstuv'),
+            { type: 'id', value: 'UCabcdefghijklmnopqrstuv' });
+        assert.deepStrictEqual(parseYouTubeChannel('https://m.youtube.com/@a_b.c-d'),
+            { type: 'handle', value: 'a_b.c-d' });
+    });
+
+    await it('refuses the legacy forms rather than guessing a channel', () => {
+        // /c/ and /user/ need a search call: 100 quota units for a result
+        // that can be the wrong channel. No badge beats a wrong number.
+        assert.strictEqual(parseYouTubeChannel('https://youtube.com/c/SomeName'), null);
+        assert.strictEqual(parseYouTubeChannel('https://youtube.com/user/SomeName'), null);
+    });
+
+    await it('a video link is not a channel', () => {
+        assert.strictEqual(parseYouTubeChannel('https://youtube.com/watch?v=dQw4w9WgXcQ'), null);
+    });
+
+    await it('rejects other hosts, other protocols and malformed ids', () => {
+        assert.strictEqual(parseYouTubeChannel('https://youtube.com.evil.tld/@x'), null);
+        assert.strictEqual(parseYouTubeChannel('javascript:alert(1)'), null);
+        assert.strictEqual(parseYouTubeChannel('https://vimeo.com/@x'), null);
+        assert.strictEqual(parseYouTubeChannel('https://youtube.com/channel/NOTUC'), null);
+        assert.strictEqual(parseYouTubeChannel('https://youtube.com/@ab'), null);
+        assert.strictEqual(parseYouTubeChannel(''), null);
+        assert.strictEqual(parseYouTubeChannel(null), null);
+    });
+});
+
+await describe('youtube -- how the number reads', async () => {
+    const { formatSubscribers } = require('../src/lib/youtube');
+
+    await it('matches the shape YouTube itself prints', () => {
+        assert.strictEqual(formatSubscribers(999), '999');
+        assert.strictEqual(formatSubscribers(1234), '1.23K');
+        assert.strictEqual(formatSubscribers(45678), '45.7K');
+        assert.strictEqual(formatSubscribers(1234567), '1.23M');
+    });
+
+    await it('promotes the unit when rounding rolls over', () => {
+        // The first version answered "1000K" here: it picked the unit from
+        // the raw value, then rounded 999.999 up to 1000 inside it.
+        assert.strictEqual(formatSubscribers(999999), '1M');
+        assert.strictEqual(formatSubscribers(999999999), '1B');
+    });
+
+    await it('returns null for anything that is not a count', () => {
+        assert.strictEqual(formatSubscribers(-1), null);
+        assert.strictEqual(formatSubscribers('abc'), null);
+        assert.strictEqual(formatSubscribers(Infinity), null);
+        assert.strictEqual(formatSubscribers(undefined), null);
+    });
+});
+
+await describe('youtube -- lookups', async () => {
+    const { createYouTubeStats } = require('../src/lib/youtube');
+    const CHANNEL = 'https://youtube.com/@someone';
+
+    const build = (over) => {
+        const calls = [];
+        const stats = createYouTubeStats(Object.assign({
+            apiKey: 'test-key',
+            log: () => {},
+            fetchJson: async (url) => {
+                calls.push(url);
+                return { items: [{ statistics: { subscriberCount: '12345' }, snippet: { title: 'Someone' } }] };
+            }
+        }, over || {}));
+        return { stats, calls };
+    };
+
+    await it('returns the count, formatted, with the channel title', async () => {
+        const { stats } = build();
+        const r = await stats.subscribersFor(CHANNEL);
+        assert.deepStrictEqual(r, { ok: true, subscribers: 12345, display: '12.3K', title: 'Someone' });
+    });
+
+    await it('asks by handle for @links and by id for /channel/ links', async () => {
+        const { stats, calls } = build();
+        await stats.subscribersFor(CHANNEL);
+        await stats.subscribersFor('https://youtube.com/channel/UCabcdefghijklmnopqrstuv');
+        assert.ok(calls[0].includes('forHandle=%40someone'), 'handle call: ' + calls[0]);
+        assert.ok(calls[1].includes('id=UCabcdefghijklmnopqrstuv'), 'id call: ' + calls[1]);
+    });
+
+    await it('never contacts YouTube without a key', async () => {
+        const { stats, calls } = build({ apiKey: '' });
+        assert.deepStrictEqual(await stats.subscribersFor(CHANNEL), { ok: false, reason: 'not-configured' });
+        assert.strictEqual(calls.length, 0);
+    });
+
+    await it('never contacts YouTube for a URL it cannot use', async () => {
+        const { stats, calls } = build();
+        assert.deepStrictEqual(await stats.subscribersFor('https://youtube.com/c/Legacy'),
+            { ok: false, reason: 'unsupported-url' });
+        assert.strictEqual(calls.length, 0);
+    });
+
+    await it('serves a repeat from cache instead of spending quota', async () => {
+        const { stats, calls } = build();
+        await stats.subscribersFor(CHANNEL);
+        await stats.subscribersFor(CHANNEL);
+        await stats.subscribersFor(CHANNEL);
+        assert.strictEqual(calls.length, 1, 'called YouTube ' + calls.length + ' times for one channel');
+    });
+
+    await it('calls again once the cache has expired', async () => {
+        let t = 1000;
+        const { stats, calls } = build({ now: () => t });
+        await stats.subscribersFor(CHANNEL);
+        t += 6 * 60 * 60 * 1000 + 1;
+        await stats.subscribersFor(CHANNEL);
+        assert.strictEqual(calls.length, 2);
+    });
+
+    await it('collapses a burst for the same channel into one call', async () => {
+        // The cache is written when a fetch RESOLVES. Without in-flight
+        // dedupe, every visitor arriving before the first response landed
+        // would spend a quota unit of their own.
+        let release;
+        const gate = new Promise(res => { release = res; });
+        const calls = [];
+        const stats = createYouTubeStats({
+            apiKey: 'k', log: () => {},
+            fetchJson: async (url) => {
+                calls.push(url);
+                await gate;
+                return { items: [{ statistics: { subscriberCount: '500' } }] };
+            }
+        });
+        const all = Promise.all([1, 2, 3, 4, 5].map(() => stats.subscribersFor(CHANNEL)));
+        release();
+        const results = await all;
+        assert.strictEqual(calls.length, 1, 'made ' + calls.length + ' calls for one burst');
+        results.forEach(r => assert.strictEqual(r.display, '500'));
+    });
+
+    await it('stops calling once the daily budget is spent', async () => {
+        const calls = [];
+        const stats = createYouTubeStats({
+            apiKey: 'k', log: () => {}, maxPerDay: 2,
+            fetchJson: async (url) => {
+                calls.push(url);
+                return { items: [{ statistics: { subscriberCount: '1' } }] };
+            }
+        });
+        await stats.subscribersFor('https://youtube.com/@aaa');
+        await stats.subscribersFor('https://youtube.com/@bbb');
+        const third = await stats.subscribersFor('https://youtube.com/@ccc');
+        assert.deepStrictEqual(third, { ok: false, reason: 'budget' });
+        assert.strictEqual(calls.length, 2, 'spent ' + calls.length + ' units against a budget of 2');
+    });
+
+    await it('a spent budget still serves channels already cached', async () => {
+        // Otherwise the first stranger to exhaust the budget takes the
+        // badge off every real tournament on the platform.
+        const stats = createYouTubeStats({
+            apiKey: 'k', log: () => {}, maxPerDay: 1,
+            fetchJson: async () => ({ items: [{ statistics: { subscriberCount: '900' } }] })
+        });
+        await stats.subscribersFor('https://youtube.com/@aaa');
+        await stats.subscribersFor('https://youtube.com/@bbb');
+        const again = await stats.subscribersFor('https://youtube.com/@aaa');
+        assert.strictEqual(again.ok, true);
+        assert.strictEqual(again.display, '900');
+    });
+
+    await it('the budget resets after a day', async () => {
+        let t = 0;
+        const calls = [];
+        const stats = createYouTubeStats({
+            apiKey: 'k', log: () => {}, maxPerDay: 1, now: () => t,
+            fetchJson: async (u) => { calls.push(u); return { items: [{ statistics: { subscriberCount: '1' } }] }; }
+        });
+        await stats.subscribersFor('https://youtube.com/@aaa');
+        assert.deepStrictEqual(await stats.subscribersFor('https://youtube.com/@bbb'), { ok: false, reason: 'budget' });
+        t += 24 * 60 * 60 * 1000 + 1;
+        const after = await stats.subscribersFor('https://youtube.com/@bbb');
+        assert.strictEqual(after.ok, true);
+        assert.strictEqual(calls.length, 2);
+    });
+
+    await it('reports hidden counts as hidden, not as zero', async () => {
+        const { stats } = build({
+            fetchJson: async () => ({ items: [{ statistics: { hiddenSubscriberCount: true } }] })
+        });
+        assert.deepStrictEqual(await stats.subscribersFor(CHANNEL), { ok: false, reason: 'hidden' });
+    });
+
+    await it('reports an absent count as hidden too', async () => {
+        const { stats } = build({ fetchJson: async () => ({ items: [{ statistics: {} }] }) });
+        assert.deepStrictEqual(await stats.subscribersFor(CHANNEL), { ok: false, reason: 'hidden' });
+    });
+
+    await it('reports an unknown channel as not-found', async () => {
+        const { stats } = build({ fetchJson: async () => ({ items: [] }) });
+        assert.deepStrictEqual(await stats.subscribersFor(CHANNEL), { ok: false, reason: 'not-found' });
+    });
+
+    await it('swallows a network failure instead of throwing at the page', async () => {
+        const { stats } = build({ fetchJson: async () => { throw new Error('ECONNRESET'); } });
+        assert.deepStrictEqual(await stats.subscribersFor(CHANNEL), { ok: false, reason: 'unreachable' });
+    });
+
+    await it('does not cache an outage -- the badge returns when YouTube does', async () => {
+        let fail = true;
+        const stats = createYouTubeStats({
+            apiKey: 'k', log: () => {},
+            fetchJson: async () => {
+                if (fail) throw new Error('down');
+                return { items: [{ statistics: { subscriberCount: '77' } }] };
+            }
+        });
+        assert.strictEqual((await stats.subscribersFor(CHANNEL)).reason, 'unreachable');
+        fail = false;
+        assert.strictEqual((await stats.subscribersFor(CHANNEL)).display, '77');
+    });
+
+    await it('the API key never appears in anything it returns', async () => {
+        const { stats } = build();
+        const r = await stats.subscribersFor(CHANNEL);
+        assert.ok(!JSON.stringify(r).includes('test-key'), 'the key leaked into the response body');
+    });
+});
+
+await describe('youtube -- the endpoint in front of it', async () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'api', 'apiRouter.js'), 'utf8');
+
+    await it('is registered before the Discord-readiness gate', () => {
+        // This endpoint never touches Discord. Behind the gate, a Render
+        // restart would 503 the badge for the minute the gateway takes to
+        // reconnect, on pages that are otherwise fine.
+        const route = src.indexOf("router.get('/youtube-subs'");
+        const gate = src.indexOf('Bot is still starting up');
+        assert.ok(route > 0 && gate > 0, 'route or gate missing');
+        assert.ok(route < gate, 'the badge route sits behind the gateway-readiness gate');
+    });
+
+    await it('is rate limited', () => {
+        assert.ok(/router\.get\('\/youtube-subs',\s*rateLimitPublic/.test(src),
+            'no rate limiter on an unauthenticated endpoint');
+    });
+
+    await it('has a looser cap than the DM endpoints, but still a cap', () => {
+        const m = src.match(/const PUBLIC_RATE_LIMIT_MAX = (\d+);/);
+        assert.ok(m, 'PUBLIC_RATE_LIMIT_MAX not defined');
+        const max = Number(m[1]);
+        assert.ok(max > 20, 'a page-view endpoint capped at the DM rate would throttle ordinary reads');
+        assert.ok(max <= 1000, 'effectively uncapped');
+    });
+
+    await it('bounds the URL it will parse', () => {
+        assert.ok(/url\.length > 300/.test(src), 'accepts an unbounded string from an anonymous caller');
+    });
+
+    await it('answers 200 for every outcome, so a missing badge is not a console error', () => {
+        const block = src.slice(src.indexOf("router.get('/youtube-subs'"));
+        const body = block.slice(0, block.indexOf('\n    });'));
+        assert.ok(/res\.status\(200\)\.json\(result\)/.test(body), 'the result is not returned as 200');
+        assert.ok(!/res\.status\(5\d\d\)/.test(body), 'a 5xx leaks out of a decoration');
+    });
+
+    await it('lets the browser cache it too', () => {
+        const block = src.slice(src.indexOf("router.get('/youtube-subs'"));
+        assert.ok(/Cache-Control['"],\s*['"]public, max-age=\d+/.test(block.slice(0, 2000)),
+            'no Cache-Control, so every navigation re-asks the bot');
+    });
+
+    await it('reads the key from the environment and never returns it', () => {
+        assert.ok(/apiKey: process\.env\.YOUTUBE_API_KEY/.test(src), 'key not sourced from env');
+        assert.ok(!/console\.log\([^)]*YOUTUBE_API_KEY/.test(src), 'the key is logged');
+        assert.ok(!/res\.json\([^)]*YOUTUBE_API_KEY/.test(src), 'the key is returned to a caller');
+    });
+});
+
 console.log('\n' + '='.repeat(60));
 console.log(passed + ' passed, ' + failed + ' failed');
 console.log('='.repeat(60));

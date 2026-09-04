@@ -79,7 +79,15 @@ app.get('/health', (req, res) => {
         // for weeks is that nothing reported it was under-firing. A
         // monitor can watch `scheduler.jobs[].stalled` and see a dead
         // timer without anyone reading a log.
-        scheduler: (() => { try { return scheduler.status(); } catch (e) { return null; } })()
+        scheduler: (() => { try { return scheduler.status(); } catch (e) { return null; } })(),
+        // Same reasoning as the scheduler above. A spent daily budget
+        // takes the subscriber badge off every tournament and looks
+        // exactly like "the channel hid its count" from the page. This
+        // makes the difference readable without digging through logs.
+        // Counts only -- never the key.
+        youtube: (() => {
+            try { return apiRouterModule.youtubeStatus(); } catch (e) { return null; }
+        })()
     });
 });
 

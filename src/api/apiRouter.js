@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { createScrimReminderJob } = require('../jobs/scrimReminders');
+const { createYouTubeStats } = require('../lib/youtube');
 const router = express.Router();
 
 // Plain `!==` leaks timing information (an attacker can narrow down the
@@ -88,6 +89,45 @@ function rateLimitNotify(req, res, next) {
     bucket.count++;
     next();
 }
+
+// Public read-only endpoints (currently just the YouTube badge) get
+// their own, looser bucket. They send no DMs and touch no user data, so
+// the 20/min ceiling meant for notifications would throttle ordinary
+// page views -- but they are unauthenticated, so they cannot be
+// unlimited either. The real quota protection is the daily lookup budget
+// inside youtube.js; this only keeps one client from monopolising the
+// process.
+const PUBLIC_RATE_LIMIT_MAX = 240;
+const publicRateBucket = { windowStart: 0, count: 0 };
+
+function rateLimitPublic(req, res, next) {
+    const now = Date.now();
+    if (now - publicRateBucket.windowStart > RATE_LIMIT_WINDOW_MS) {
+        publicRateBucket.windowStart = now;
+        publicRateBucket.count = 1;
+        return next();
+    }
+    if (publicRateBucket.count >= PUBLIC_RATE_LIMIT_MAX) {
+        return res.status(429).json({ error: 'Too many requests -- please slow down.' });
+    }
+    publicRateBucket.count++;
+    next();
+}
+
+// One instance for the process, so the six-hour cache and the daily
+// budget are shared across every request rather than per-router.
+// YOUTUBE_API_KEY: never log it, never echo it in a response -- same rule
+// as BOT_API_KEY above. It is read once, here, and only ever appended to
+// a googleapis.com URL inside youtube.js.
+const youtubeStats = createYouTubeStats({
+    apiKey: process.env.YOUTUBE_API_KEY,
+    fetchJson: async (url) => {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error('YouTube API returned ' + r.status);
+        return r.json();
+    },
+    log: console.log
+});
 
 // ---------------------------------------------------------------
 // Session-token auth (the newer model -- see /tournament-broadcast and
@@ -297,6 +337,37 @@ async function dmUserById(client, userId, message) {
 
 // Pass the Discord client to the router so endpoints can use it
 module.exports = (client) => {
+
+    // --- 0. YouTube subscriber badge (public, read-only) ---
+    //
+    // Registered BEFORE the gateway-readiness gate below on purpose. This
+    // endpoint never touches Discord, and a tournament page's badge
+    // should not disappear for the two minutes a Render restart takes to
+    // reconnect the bot.
+    //
+    // Unauthenticated because the number it returns is public on the
+    // channel's own page; requiring a session would only hide it from the
+    // logged-out spectators the badge is for. Nothing here reads or
+    // writes platform data, so there is no authorization decision to make.
+    router.get('/youtube-subs', rateLimitPublic, async (req, res) => {
+        const url = typeof req.query.url === 'string' ? req.query.url : '';
+        if (!url) return res.status(400).json({ error: 'Missing url' });
+        // A URL is an unbounded string from an anonymous caller; the
+        // parser rejects anything that is not a YouTube channel link, but
+        // there is no reason to hand it a megabyte first.
+        if (url.length > 300) return res.status(400).json({ ok: false, reason: 'unsupported-url' });
+
+        const result = await youtubeStats.subscribersFor(url);
+        // Always 200: every outcome here is a legitimate answer about a
+        // decoration, and a 4xx/5xx would show up in the browser console
+        // of a page that is working perfectly.
+        //
+        // Cached at the edge for an hour. The six-hour server cache stops
+        // us calling YouTube; this stops the browser calling US on every
+        // navigation within a session.
+        res.set('Cache-Control', 'public, max-age=3600');
+        return res.status(200).json(result);
+    });
 
     // Without this, a request arriving while the bot is still connecting
     // to Discord (e.g. right after a Render restart) would reach a route
@@ -905,5 +976,8 @@ module.exports = (client) => {
 // module: they are still only meaningful to this bot's Supabase and
 // Discord wiring, and moving them would be a bigger change than the one
 // being made.
+// Cache size and spent budget for /health. Returns counts only -- the
+// API key is never part of this, and neither are the channels looked up.
+module.exports.youtubeStatus = () => youtubeStats.status();
 module.exports.dmUserById = dmUserById;
 module.exports.callRpcAsService = callRpcAsService;
