@@ -215,12 +215,88 @@ function createYouTubeStats(deps) {
         return p;
     }
 
+
+    // ── Ownership, not just existence ────────────────────────────────
+    //
+    // subscribersFor() above answers "does this channel exist and how
+    // big is it". It cannot answer "is this the person who runs it",
+    // and that is the question an organizer application actually asks.
+    //
+    // The challenge: the applicant puts a short code derived from their
+    // own account into the channel's About description. Only somebody
+    // who can edit the channel can do that, so reading it back here is
+    // proof of control.
+    //
+    // Deliberately NOT cached, and deliberately not served from the
+    // six-hour badge cache above. Somebody who edited their description
+    // ten seconds ago must not be told "no code found" because we are
+    // holding a copy from this morning -- that is a false negative on
+    // the one call where a false negative reads as "the site is broken".
+    // Verification attempts are rare and rate-limited at the route, so
+    // the quota cost is a rounding error next to the badge traffic.
+    async function verifyOwnership(url, code) {
+        const ref = parseYouTubeChannel(url);
+        if (!ref) return { ok: false, reason: 'unsupported-url' };
+        if (!apiKey) return { ok: false, reason: 'not-configured' };
+        if (!code) return { ok: false, reason: 'no-code' };
+        if (!budgetAvailable()) return { ok: false, reason: 'budget' };
+
+        const param = ref.type === 'id'
+            ? 'id=' + encodeURIComponent(ref.value)
+            : 'forHandle=' + encodeURIComponent('@' + ref.value);
+        const api = 'https://www.googleapis.com/youtube/v3/channels?part=statistics,snippet&'
+                  + param + '&key=' + encodeURIComponent(apiKey);
+
+        let json = null;
+        try {
+            spent++;
+            json = await fetchJson(api);
+        } catch (e) {
+            log('[youtube] verify fetch failed: ' + (e && e.message));
+            return { ok: false, reason: 'unreachable' };
+        }
+        if (!json || !Array.isArray(json.items) || !json.items.length) {
+            return { ok: false, reason: 'not-found' };
+        }
+
+        const item = json.items[0];
+        const snippet = item.snippet || {};
+        const stats = item.statistics || {};
+        const description = String(snippet.description || '');
+
+        // Case-insensitive: YouTube's description box preserves case, but
+        // people retype the code by hand rather than pasting it, and
+        // rejecting MSP-a1b2 for MSP-A1B2 would be a puzzle with no clue.
+        // The code is not a secret, so nothing is weakened by matching
+        // loosely.
+        if (description.toUpperCase().indexOf(String(code).toUpperCase()) === -1) {
+            return { ok: false, reason: 'code-not-found', channelId: item.id || null };
+        }
+
+        // Hidden or absent subscriber count: ownership is still proven,
+        // and that is worth recording, but there is no number to hold
+        // against the threshold. Reported as null rather than 0, which
+        // would read as "you have no subscribers".
+        const hidden = stats.hiddenSubscriberCount === true || stats.subscriberCount === undefined;
+        const raw = hidden ? NaN : Number(stats.subscriberCount);
+        const count = isFinite(raw) ? raw : null;
+
+        return {
+            ok: true,
+            channelId: item.id || null,
+            title: snippet.title || null,
+            subscribers: count,
+            display: count === null ? null : formatSubscribers(count),
+            hiddenCount: hidden
+        };
+    }
+
     // For /health, so a spent budget is visible without reading logs.
     function status() {
         return { spentToday: spent, maxPerDay, cached: cacheStore.size, inFlight: inFlight.size };
     }
 
-    return { subscribersFor, status };
+    return { subscribersFor, verifyOwnership, status };
 }
 
 module.exports = {

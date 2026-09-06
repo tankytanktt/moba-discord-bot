@@ -289,6 +289,31 @@ function rateLimitPerToken(req, res, next) {
     next();
 }
 
+// Verification has its own bucket rather than reusing rateLimitPerToken:
+// that one is sized for Discord sends and says so in its 429, and
+// retrying IS the normal path here -- you paste the code, save the
+// description, check, find you saved the wrong channel, fix it, check
+// again. A cap that punishes the ordinary correction loop would read as
+// the feature being broken.
+const VERIFY_MAX_REQUESTS = 8;
+const verifyBuckets = new Map();
+
+function rateLimitVerify(req, res, next) {
+    const key = crypto.createHash('sha256').update(req.userToken).digest('hex');
+    const now = Date.now();
+    const bucket = verifyBuckets.get(key);
+    if (!bucket || now - bucket.windowStart > RATE_LIMIT_WINDOW_MS) {
+        verifyBuckets.set(key, { windowStart: now, count: 1 });
+        return next();
+    }
+    if (bucket.count >= VERIFY_MAX_REQUESTS) {
+        return res.status(429).json({ ok: false, reason: 'rate-limit',
+            error: 'That is a lot of checks in a row -- wait a minute and try again.' });
+    }
+    bucket.count++;
+    next();
+}
+
 // Resolve the guild behind an invite link. Split out of
 // resolveGuildMember() so a batch send can do this ONCE rather than
 // re-fetching the same invite for every player on the roster.
@@ -374,6 +399,79 @@ module.exports = (client) => {
         // navigation within a session.
         res.set('Cache-Control', 'public, max-age=3600');
         return res.status(200).json(result);
+    });
+
+    // Channel OWNERSHIP. /youtube-subs above says how big a channel is;
+    // it cannot say who runs it, and that is the question an organizer
+    // application actually asks.
+    //
+    // WHY THIS RUNS HERE AND NOT IN THE BROWSER. The page could call
+    // YouTube itself -- the data is public -- but then the answer that
+    // decides an organizer role would be a claim typed by the applicant's
+    // own client, and a tampered page can claim anything. So both facts
+    // are established on this side: the description is read with OUR api
+    // key, the subscriber count comes out of the same response, and the
+    // verdict is written with the service-role key through an RPC the
+    // browser is not granted execute on. The browser's only power here is
+    // to ask for the check to be run.
+    //
+    // Identity is NOT taken from the request body. The caller's own
+    // session token is forwarded to get_my_youtube_challenge(), which
+    // resolves discord_id() from the JWT and hands back both the id and
+    // the code -- so claiming to be somebody else would mean holding
+    // their session, which is the same bar as logging in as them.
+    //
+    // Registered before the Discord-readiness gate for the same reason
+    // the badge endpoint is: nothing here touches Discord, and a restart
+    // should not make verification fail for two minutes.
+    router.post('/youtube-verify', requireUserToken, rateLimitVerify, async (req, res) => {
+        const url = typeof req.body.url === 'string' ? req.body.url.trim() : '';
+        if (!url) return res.status(400).json({ ok: false, reason: 'missing-url' });
+        if (url.length > 300) return res.status(400).json({ ok: false, reason: 'unsupported-url' });
+
+        const challenge = await callRpc('get_my_youtube_challenge', {}, req.userToken);
+        if (!challenge || !challenge.code || !challenge.discordId) {
+            return res.status(401).json({ ok: false, reason: 'session',
+                error: 'Your session could not be verified -- please sign in again.' });
+        }
+
+        const found = await youtubeStats.verifyOwnership(url, challenge.code);
+        if (!found.ok) {
+            // 200 with a reason, not a 4xx: every one of these is a
+            // legitimate answer about a channel, and the page shows each
+            // one differently. A 4xx here would also be indistinguishable
+            // from the auth failure above.
+            return res.status(200).json({ ok: false, reason: found.reason });
+        }
+
+        // Ownership is proven. The write -- including whether this clears
+        // the subscriber bar and earns the role -- is the database's
+        // decision, made from numbers this process read from YouTube.
+        const recorded = await callRpcAsService('record_youtube_verification', {
+            p_discord_id: challenge.discordId,
+            p_url: url,
+            p_channel_id: found.channelId,
+            p_subscribers: found.subscribers
+        });
+        if (!recorded) {
+            return res.status(500).json({ ok: false, reason: 'record-failed',
+                error: 'Your channel checked out, but we could not save that. Please try again.' });
+        }
+        if (recorded.success === false) {
+            return res.status(200).json({ ok: false, reason: 'rejected', message: recorded.message });
+        }
+
+        return res.status(200).json({
+            ok: true,
+            verified: true,
+            granted: !!recorded.granted,
+            alreadyElevated: !!recorded.alreadyElevated,
+            subscribers: found.subscribers,
+            display: found.display,
+            hiddenCount: !!found.hiddenCount,
+            threshold: recorded.threshold || null,
+            channelTitle: found.title
+        });
     });
 
     // Without this, a request arriving while the bot is still connecting

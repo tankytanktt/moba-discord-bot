@@ -970,6 +970,202 @@ await describe('youtube -- lookups', async () => {
     });
 });
 
+await describe('youtube -- proving the channel is yours', async () => {
+    const { createYouTubeStats } = require('../src/lib/youtube');
+    const CHANNEL = 'https://youtube.com/@someone';
+    const CODE = 'MSP-A7F3C9D2E1';
+
+    // description and stats are what the fake API returns; calls records
+    // the URLs, so "did it go to the network at all" is answerable.
+    const build = (description, stats, over) => {
+        const calls = [];
+        const y = createYouTubeStats(Object.assign({
+            apiKey: 'test-key',
+            log: () => {},
+            fetchJson: async (url) => {
+                calls.push(url);
+                return { items: [{ id: 'UCabc', snippet: { description, title: 'Someone' },
+                                   statistics: stats || { subscriberCount: '12345' } }] };
+            }
+        }, over || {}));
+        return { y, calls };
+    };
+
+    await it('says yes when the code is in the description', async () => {
+        const { y } = build('We play games. ' + CODE + ' Subscribe!');
+        const r = await y.verifyOwnership(CHANNEL, CODE);
+        assert.strictEqual(r.ok, true);
+        assert.strictEqual(r.channelId, 'UCabc');
+        assert.strictEqual(r.subscribers, 12345);
+        assert.strictEqual(r.display, '12.3K');
+    });
+
+    await it('says no when it is not, and still names the channel', async () => {
+        const { y } = build('No code here.');
+        const r = await y.verifyOwnership(CHANNEL, CODE);
+        assert.strictEqual(r.ok, false);
+        assert.strictEqual(r.reason, 'code-not-found');
+        // The id is returned anyway: the caller can tell "wrong channel"
+        // from "right channel, code missing" without a second lookup.
+        assert.strictEqual(r.channelId, 'UCabc');
+    });
+
+    await it('matches case-insensitively -- people retype it by hand', async () => {
+        const { y } = build('about us: msp-a7f3c9d2e1');
+        assert.strictEqual((await y.verifyOwnership(CHANNEL, CODE)).ok, true);
+    });
+
+    await it('will not accept an empty code as a match', async () => {
+        // Without this guard '' is a substring of every description in
+        // existence, and every channel on YouTube verifies.
+        const { y, calls } = build('anything at all');
+        const r = await y.verifyOwnership(CHANNEL, '');
+        assert.strictEqual(r.ok, false);
+        assert.strictEqual(r.reason, 'no-code');
+        assert.strictEqual(calls.length, 0, 'it should not even ask YouTube');
+    });
+
+    await it('does not read the badge cache -- a description edited a minute ago must count', async () => {
+        let description = 'nothing yet';
+        const { y, calls } = build('placeholder', null, {
+            fetchJson: async (url) => {
+                calls.push(url);
+                return { items: [{ id: 'UCabc', snippet: { description },
+                                   statistics: { subscriberCount: '900' } }] };
+            }
+        });
+        // Warm whatever cache exists, the way a page load would.
+        await y.subscribersFor(CHANNEL);
+        assert.strictEqual((await y.verifyOwnership(CHANNEL, CODE)).reason, 'code-not-found');
+
+        description = 'now with ' + CODE;
+        const r = await y.verifyOwnership(CHANNEL, CODE);
+        assert.strictEqual(r.ok, true, 'a cached description would have failed this');
+    });
+
+    await it('does not poison the badge cache either', async () => {
+        const { y } = build('has ' + CODE, { subscriberCount: '900' });
+        await y.verifyOwnership(CHANNEL, CODE);
+        const badge = await y.subscribersFor(CHANNEL);
+        // If verifyOwnership had written its own shape into the cache,
+        // the badge would come back with channelId/hiddenCount on it.
+        assert.strictEqual(badge.ok, true);
+        assert.strictEqual(badge.display, '900');
+        assert.strictEqual(badge.channelId, undefined);
+    });
+
+    await it('reports a hidden subscriber count as null, not zero', async () => {
+        const { y } = build('has ' + CODE, { hiddenSubscriberCount: true });
+        const r = await y.verifyOwnership(CHANNEL, CODE);
+        // Ownership IS proven -- the code is there. Only the number is
+        // unavailable, and 0 would be a number we were never told.
+        assert.strictEqual(r.ok, true);
+        assert.strictEqual(r.subscribers, null);
+        assert.strictEqual(r.display, null);
+        assert.strictEqual(r.hiddenCount, true);
+    });
+
+    await it('refuses a URL shape it cannot resolve in one call', async () => {
+        const { y, calls } = build('has ' + CODE);
+        const r = await y.verifyOwnership('https://youtube.com/c/LegacyName', CODE);
+        assert.strictEqual(r.reason, 'unsupported-url');
+        assert.strictEqual(calls.length, 0);
+    });
+
+    await it('respects the daily budget, and counts against the same one', async () => {
+        const { y } = build('has ' + CODE, null, { maxPerDay: 1 });
+        assert.strictEqual((await y.verifyOwnership(CHANNEL, CODE)).ok, true);
+        // Second call: budget spent. Not a silent success, and not a throw.
+        assert.strictEqual((await y.verifyOwnership(CHANNEL, CODE)).reason, 'budget');
+        assert.strictEqual(y.status().spentToday, 1);
+    });
+
+    await it('never throws at the caller when YouTube is down', async () => {
+        const { y } = build('has ' + CODE, null, {
+            fetchJson: async () => { throw new Error('down'); }
+        });
+        const r = await y.verifyOwnership(CHANNEL, CODE);
+        assert.strictEqual(r.ok, false);
+        assert.strictEqual(r.reason, 'unreachable');
+    });
+
+    await it('the API key never appears in anything it returns', async () => {
+        const { y } = build('has ' + CODE);
+        const r = await y.verifyOwnership(CHANNEL, CODE);
+        assert.ok(!JSON.stringify(r).includes('test-key'), 'the key leaked into the response body');
+    });
+});
+
+await describe('youtube -- the verification endpoint', async () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'api', 'apiRouter.js'), 'utf8');
+
+    await it('takes the identity from the session, never from the body', async () => {
+        // If the discord id could be posted, anybody could verify a
+        // channel onto somebody else's account.
+        assert.ok(/callRpc\('get_my_youtube_challenge', \{\}, req\.userToken\)/.test(src));
+        assert.ok(/p_discord_id: challenge\.discordId/.test(src));
+        assert.ok(!/req\.body\.(discordId|userId)/.test(src));
+    });
+
+    await it('writes the verdict with the service key, not the caller session', async () => {
+        // record_youtube_verification is granted to service_role only.
+        // Called through callRpc it would be refused -- and, worse, if it
+        // were ever granted to `authenticated` the browser could call it
+        // directly and skip this endpoint entirely.
+        assert.ok(/callRpcAsService\('record_youtube_verification'/.test(src));
+    });
+
+    await it('requires a session at all', async () => {
+        const route = src.indexOf("router.post('/youtube-verify'");
+        assert.ok(route > 0, 'route missing');
+        const line = src.slice(route, src.indexOf('\n', route));
+        assert.ok(/requireUserToken/.test(line), 'the route is unauthenticated');
+        assert.ok(/rateLimitVerify/.test(line), 'the route is unlimited');
+    });
+
+    await it('is registered before the Discord-readiness gate', async () => {
+        // Nothing here touches Discord; a Render restart should not make
+        // verification fail for the minute the gateway takes to reconnect.
+        const route = src.indexOf("router.post('/youtube-verify'");
+        const gate = src.indexOf('Bot is still starting up');
+        assert.ok(route > 0 && gate > 0);
+        assert.ok(route < gate, 'verification sits behind the gateway-readiness gate');
+    });
+
+    await it('answers 200 with a reason for every legitimate negative', async () => {
+        // A 4xx would be indistinguishable from the auth failure, and the
+        // page shows each of these differently.
+        const route = src.slice(src.indexOf("router.post('/youtube-verify'"),
+                                src.indexOf('// Without this, a request arriving'));
+        assert.ok(/return res\.status\(200\)\.json\(\{ ok: false, reason: found\.reason \}\)/.test(route));
+        assert.ok(/return res\.status\(200\)\.json\(\{ ok: false, reason: 'rejected'/.test(route));
+    });
+
+    await it('uses `error` on non-2xx, which is the key the browser reads', async () => {
+        // _botFetch drops `message` on a non-2xx and substitutes "Bot
+        // request failed", so any of these carrying `message` instead
+        // would reach the user as that generic string.
+        //
+        // Two of the three live in the handler; the 429 is in
+        // rateLimitVerify, which runs before it. Checked in both places
+        // rather than widening the slice, so this cannot start passing
+        // because it accidentally swallowed a neighbouring route.
+        const route = src.slice(src.indexOf("router.post('/youtube-verify'"),
+                                src.indexOf('// Without this, a request arriving'));
+        const limiter = src.slice(src.indexOf('function rateLimitVerify'),
+                                  src.indexOf('// Resolve the guild behind an invite link'));
+        const replies = (route.match(/res\.status\((401|500)\)\.json\(\{[^}]*\}/g) || [])
+            .concat(limiter.match(/res\.status\(429\)\.json\(\{[^}]*\}/g) || []);
+        assert.strictEqual(replies.length, 3, 'expected three non-2xx replies, got ' + replies.length);
+        replies.forEach(m => assert.ok(/error:/.test(m), 'non-2xx reply without an `error` key: ' + m));
+    });
+
+    await it('bounds the URL it will parse', async () => {
+        const route = src.slice(src.indexOf("router.post('/youtube-verify'"));
+        assert.ok(/url\.length > 300/.test(route.slice(0, 900)));
+    });
+});
+
 await describe('youtube -- the endpoint in front of it', async () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'api', 'apiRouter.js'), 'utf8');
 
