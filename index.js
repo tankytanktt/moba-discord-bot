@@ -6,6 +6,8 @@ const fs = require('fs');
 const path = require('path');
 const { createScheduler } = require('./src/lib/scheduler');
 const { createScrimReminderJob } = require('./src/jobs/scrimReminders');
+const { createPushDispatchJob } = require('./src/jobs/pushDispatch');
+const webpush = require('./src/lib/webpush');
 
 // --- 1. Set up Express API Server ---
 const app = express();
@@ -170,6 +172,29 @@ scheduler.register({
         callRpc: apiRouterModule.callRpcAsService,
         dmUser: (userId, text) => apiRouterModule.dmUserById(client, userId, text),
         gatewayUp: () => { try { return client.isReady(); } catch (e) { return false; } }
+    }).run
+});
+
+// Web Push dispatch.
+//
+// Every minute rather than every five: these are deadlines. A check-in
+// reminder that arrives four minutes late has lost most of its value,
+// and the sweep costs one RPC returning an empty array when there is
+// nothing to send.
+//
+// No Discord dependency at all -- unlike the scrim reminders this does
+// not DM anyone, it talks to a push service -- so it runs happily while
+// the gateway is down. `enabled` gates on the VAPID keys instead: with
+// none configured the job is skipped entirely rather than looping over
+// rows it cannot deliver.
+scheduler.register({
+    name: 'push-dispatch',
+    everyMs: Number(process.env.PUSH_DISPATCH_INTERVAL_MS) || 60 * 1000,
+    enabled: () => webpush.configured(),
+    run: createPushDispatchJob({
+        callRpc: apiRouterModule.callRpcAsService,
+        sendPush: webpush.sendPush,
+        configured: webpush.configured
     }).run
 });
 

@@ -2,6 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { createScrimReminderJob } = require('../jobs/scrimReminders');
 const { createYouTubeStats } = require('../lib/youtube');
+const webpush = require('../lib/webpush');
 const router = express.Router();
 
 // Plain `!==` leaks timing information (an attacker can narrow down the
@@ -381,6 +382,18 @@ module.exports = (client) => {
     // channel's own page; requiring a session would only hide it from the
     // logged-out spectators the badge is for. Nothing here reads or
     // writes platform data, so there is no authorization decision to make.
+    // --- Web Push: the application server key ---
+    // Unauthenticated, and that is correct rather than an oversight: a
+    // VAPID PUBLIC key is public by construction. Every browser that
+    // subscribes receives it, and it is useless without the private half,
+    // which never leaves this process. Served from here rather than baked
+    // into the site so rotating the pair does not need a site deploy.
+    router.get('/push-public-key', rateLimitPublic, (req, res) => {
+        const key = webpush.publicKey();
+        if (!key) return res.status(503).json({ ok: false, reason: 'not-configured' });
+        res.json({ ok: true, key: key });
+    });
+
     router.get('/youtube-subs', rateLimitPublic, async (req, res) => {
         const url = typeof req.query.url === 'string' ? req.query.url : '';
         if (!url) return res.status(400).json({ error: 'Missing url' });
@@ -1027,6 +1040,110 @@ module.exports = (client) => {
             return res.status(400).json({ error: result.message, ...result });
         }
         console.log(`[API] Paid registration completed for order ${razorpayOrderId} -> team ${result.teamId}`);
+        return res.status(200).json(result);
+    });
+
+    // ---------------------------------------------------------------
+    // 3d/3e. Wallet top-up. The same two-step shape as 3a/3b above,
+    // for the same reasons: the amount is re-validated in Postgres
+    // before an order exists, and the credit only happens behind a
+    // verified signature.
+    //
+    // The one difference worth noting: the amount here is chosen by the
+    // CLIENT, which the registration fee never is (that is read off the
+    // tournament row). So it is the one number in either flow that
+    // cannot be trusted, and precheck_wallet_topup bounds it server-side
+    // before a single rupee is quoted to Razorpay.
+    // ---------------------------------------------------------------
+    router.post('/wallet/topup-create-order', requireUserToken, async (req, res) => {
+        if (!razorpayConfigured()) {
+            return res.status(500).json({ error: 'Payments are not configured on the bot yet.' });
+        }
+        const amountPaise = Number(req.body && req.body.amountPaise);
+        if (!Number.isInteger(amountPaise) || amountPaise <= 0) {
+            return res.status(400).json({ error: 'Missing or invalid amountPaise.' });
+        }
+
+        const precheck = await callRpc('precheck_wallet_topup', { p_amount_paise: amountPaise }, req.userToken);
+        if (!precheck) {
+            return res.status(401).json({ error: 'Your session could not be verified -- please sign in again.' });
+        }
+        if (!precheck.success) {
+            return res.status(400).json({ error: precheck.message });
+        }
+
+        // precheck.amountPaise, not the request's: the server's idea of
+        // the amount is the only one that reaches Razorpay.
+        const order = await razorpayFetch('/orders', {
+            method: 'POST',
+            body: JSON.stringify({
+                amount: precheck.amountPaise,
+                currency: 'INR',
+                receipt: `topup-${Date.now()}`.slice(0, 40),
+                notes: { kind: 'wallet_topup' }
+            })
+        });
+        if (!order) {
+            return res.status(502).json({ error: 'Could not start the top-up -- please try again.' });
+        }
+
+        const created = await callRpc('create_wallet_topup', {
+            p_razorpay_order_id: order.id,
+            p_amount_paise: precheck.amountPaise
+        }, req.userToken);
+        if (!created) {
+            return res.status(401).json({ error: 'Your session could not be verified -- please sign in again.' });
+        }
+        if (!created.success) {
+            return res.status(400).json({ error: created.message });
+        }
+
+        return res.status(200).json({
+            razorpayOrderId: created.razorpayOrderId,
+            amountPaise: created.amountPaise,
+            keyId: RAZORPAY_KEY_ID
+        });
+    });
+
+    router.post('/wallet/topup-verify', requireUserToken, async (req, res) => {
+        if (!razorpayConfigured()) {
+            return res.status(500).json({ error: 'Payments are not configured on the bot yet.' });
+        }
+        const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body || {};
+        if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+            return res.status(400).json({ error: 'Missing payment verification fields.' });
+        }
+
+        // Checkout signature: HMAC over order_id + "|" + payment_id.
+        // A different signature from the webhook's, which is over the
+        // raw body. Fail closed on any mismatch or thrown error.
+        let expected;
+        try {
+            expected = crypto.createHmac('sha256', RAZORPAY_KEY_SECRET)
+                .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+                .digest('hex');
+        } catch (err) {
+            console.error('[Razorpay] topup-verify HMAC computation failed:', err.message);
+            return res.status(400).json({ error: 'Could not verify this payment.' });
+        }
+        if (!safeKeysMatch(razorpaySignature, expected)) {
+            return res.status(401).json({ error: 'Payment signature does not match.' });
+        }
+
+        // As service: this one moves money and is revoked from every
+        // browser role. Safe to call twice -- it flips the row's status
+        // under a lock and credits nothing the second time.
+        const result = await callRpcAsService('complete_wallet_topup', {
+            p_razorpay_order_id: razorpayOrderId,
+            p_razorpay_payment_id: razorpayPaymentId
+        });
+        if (!result) {
+            return res.status(500).json({ error: 'Payment taken but the wallet could not be credited -- contact support with payment ID ' + razorpayPaymentId + '.' });
+        }
+        if (!result.success) {
+            return res.status(400).json({ error: result.message, ...result });
+        }
+        console.log(`[API] Wallet top-up credited for order ${razorpayOrderId}${result.alreadyCredited ? ' (already credited)' : ''}`);
         return res.status(200).json(result);
     });
 

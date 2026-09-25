@@ -23,6 +23,209 @@ async function it(name, fn) {
 (async function main() {
 
 // ---------------------------------------------------------------
+// Web Push dispatch -- the sweep that puts a notification on a phone.
+// ---------------------------------------------------------------
+await describe('push dispatch', async () => {
+    const { createPushDispatchJob, groupByNotification, payloadFor, isDeadEndpoint } =
+        require(path.join(__dirname, '..', 'src', 'jobs', 'pushDispatch'));
+
+    // One notification, two devices -- the shape the RPC returns.
+    const ROWS = [
+        { id: 7, type: 'checkin', title: 'Check-in is open', body: 'Kerala Cup', link: '#/tournament?id=T1',
+          endpoint: 'https://push.example/a', p256dh: 'pa', auth: 'aa' },
+        { id: 7, type: 'checkin', title: 'Check-in is open', body: 'Kerala Cup', link: '#/tournament?id=T1',
+          endpoint: 'https://push.example/b', p256dh: 'pb', auth: 'ab' },
+        { id: 9, type: 'match', title: 'Match scheduled', body: 'tonight', link: '#/tournament?id=T1&tab=schedule',
+          endpoint: 'https://push.example/a', p256dh: 'pa', auth: 'aa' }
+    ];
+
+    const mkJob = (over) => {
+        const calls = [];
+        const sends = [];
+        const deps = Object.assign({
+            callRpc: async (name, args) => {
+                calls.push({ name, args });
+                if (name === 'get_notifications_needing_push') return ROWS;
+                return true;
+            },
+            sendPush: async (sub, payload) => { sends.push({ sub, payload }); return { ok: true, statusCode: 201 }; },
+            configured: () => true,
+            log: () => {}
+        }, over || {});
+        return { job: createPushDispatchJob(deps), calls, sends };
+    };
+
+    await it('groups a row-per-(notification, device) result back into notifications', () => {
+        const g = groupByNotification(ROWS);
+        assert.strictEqual(g.length, 2, 'two notifications');
+        assert.strictEqual(g[0].subs.length, 2, 'the first reaches two devices');
+        assert.strictEqual(g[1].subs.length, 1, 'the second reaches one');
+        assert.strictEqual(g[0].title, 'Check-in is open');
+    });
+
+    await it('survives malformed rows without dropping the good ones', () => {
+        const g = groupByNotification([null, { id: null }, ROWS[0], { id: 7 }]);
+        assert.strictEqual(g.length, 1);
+        assert.strictEqual(g[0].subs.length, 1, 'a row with no endpoint adds no device');
+        assert.strictEqual(groupByNotification(null).length, 0, 'a missing list does not throw');
+    });
+
+    await it('sends one push per device and marks the notification once', async () => {
+        const { job, calls, sends } = mkJob();
+        const out = await job.run();
+        assert.strictEqual(sends.length, 3, 'three sends: two devices + one');
+        assert.strictEqual(out.sent, 3);
+        const marks = calls.filter(c => c.name === 'mark_notification_pushed');
+        assert.strictEqual(marks.length, 2, 'marked once per notification, not once per device');
+        assert.deepStrictEqual(marks.map(m => m.args.p_id), [7, 9]);
+    });
+
+    await it('marks AFTER sending, so a crash re-sends rather than silently skipping', async () => {
+        const order = [];
+        const { job } = mkJob({
+            callRpc: async (name) => { order.push('rpc:' + name); return name === 'get_notifications_needing_push' ? [ROWS[0]] : true; },
+            sendPush: async () => { order.push('send'); return { ok: true, statusCode: 201 }; }
+        });
+        await job.run();
+        assert.ok(order.indexOf('send') < order.indexOf('rpc:mark_notification_pushed'),
+            'the mark must come after the send');
+    });
+
+    await it('retires an endpoint the push service says is gone', async () => {
+        const { job, calls } = mkJob({
+            sendPush: async (sub) => sub.endpoint.endsWith('/b')
+                ? { ok: false, statusCode: 410 }
+                : { ok: true, statusCode: 201 }
+        });
+        const out = await job.run();
+        assert.strictEqual(out.dropped, 1);
+        const drops = calls.filter(c => c.name === 'drop_push_subscription');
+        assert.strictEqual(drops.length, 1);
+        assert.strictEqual(drops[0].args.p_endpoint, 'https://push.example/b');
+    });
+
+    await it('keeps an endpoint that failed for a temporary reason', async () => {
+        // 429 and 500 are the push service being busy or broken. Deleting
+        // on those silently unsubscribes somebody who did nothing wrong.
+        for (const code of [0, 429, 500, 503]) {
+            const { job, calls } = mkJob({ sendPush: async () => ({ ok: false, statusCode: code }) });
+            await job.run();
+            assert.strictEqual(calls.filter(c => c.name === 'drop_push_subscription').length, 0,
+                'status ' + code + ' must not retire the endpoint');
+        }
+        assert.strictEqual(isDeadEndpoint(410), true);
+        assert.strictEqual(isDeadEndpoint(404), true);
+        assert.strictEqual(isDeadEndpoint(500), false);
+    });
+
+    await it('still marks when every send failed, rather than retrying forever', async () => {
+        const { job, calls } = mkJob({ sendPush: async () => ({ ok: false, statusCode: 500 }) });
+        const out = await job.run();
+        assert.strictEqual(out.failed, 3);
+        assert.strictEqual(calls.filter(c => c.name === 'mark_notification_pushed').length, 2);
+    });
+
+    await it('a throwing sender does not abandon the rest of the batch', async () => {
+        let n = 0;
+        const { job, sends } = mkJob({
+            sendPush: async (sub, payload) => {
+                n++;
+                if (n === 1) throw new Error('library exploded');
+                sends.push({ sub, payload });
+                return { ok: true, statusCode: 201 };
+            }
+        });
+        const out = await job.run();
+        assert.strictEqual(out.failed, 1, 'the thrown one counts as a failure');
+        assert.strictEqual(out.sent, 2, 'and the other two still went');
+    });
+
+    await it('skips entirely when no VAPID keys are configured', async () => {
+        const { job, calls } = mkJob({ configured: () => false });
+        const out = await job.run();
+        assert.deepStrictEqual(out, { skipped: 'no-vapid-keys' });
+        assert.strictEqual(calls.length, 0, 'and asks Supabase for nothing');
+    });
+
+    await it('treats an unreachable Supabase as a quiet no-op, not an error', async () => {
+        const { job } = mkJob({ callRpc: async () => null });
+        const out = await job.run();
+        assert.deepStrictEqual(out, { error: 'supabase-unreachable' });
+    });
+
+    await it('does nothing when the queue is empty', async () => {
+        const { job, sends } = mkJob({ callRpc: async () => [] });
+        const out = await job.run();
+        assert.deepStrictEqual(out, { notifications: 0, sent: 0 });
+        assert.strictEqual(sends.length, 0);
+    });
+
+    await it('builds a payload the service worker can use', () => {
+        const p = payloadFor(ROWS[0]);
+        assert.strictEqual(p.title, 'Check-in is open');
+        assert.strictEqual(p.url, '#/tournament?id=T1', 'the link becomes the click target');
+        assert.ok(p.tag.indexOf('checkin') >= 0, 'the tag carries the type');
+    });
+
+    await it('tags so repeats replace but unrelated messages do not', () => {
+        const a = payloadFor(ROWS[0]);
+        const b = payloadFor(Object.assign({}, ROWS[0], { title: 'Check-in closes soon' }));
+        assert.strictEqual(a.tag, b.tag, 'two check-ins for one tournament collapse to one line');
+
+        // SAME link, different type. The earlier version of this compared
+        // two rows whose links already differed, so the tags differed
+        // whether or not `type` was in them -- it could not tell the two
+        // implementations apart, and the canary caught it.
+        const sameLinkDifferentType = payloadFor(Object.assign({}, ROWS[0], { type: 'match' }));
+        assert.notStrictEqual(a.tag, sameLinkDifferentType.tag,
+            'a match notification must not replace a check-in about the same tournament');
+
+        const differentLink = payloadFor(ROWS[2]);
+        assert.notStrictEqual(a.tag, differentLink.tag, 'and a different destination is its own line');
+    });
+
+    await it('never produces an empty title -- a push that shows nothing loses the permission', () => {
+        assert.strictEqual(payloadFor({}).title, 'MSP');
+        assert.strictEqual(payloadFor(null).title, 'MSP');
+        assert.strictEqual(payloadFor({ link: null }).url, '#/');
+    });
+});
+
+// ---------------------------------------------------------------
+// The sender wrapper -- must never take the bot down with it.
+// ---------------------------------------------------------------
+await describe('web push sender', async () => {
+    const wp = require(path.join(__dirname, '..', 'src', 'lib', 'webpush'));
+
+    await it('loads even when the web-push package is absent', () => {
+        // The dependency lands in package.json before the next npm install
+        // runs on Render, and a deploy can sit between the two. A bare
+        // require would throw at boot and take Discord, the API and the
+        // scrim reminders down with it.
+        assert.ok(wp.status(), 'status() answers regardless');
+        assert.strictEqual(typeof wp.configured(), 'boolean');
+    });
+
+    await it('reports not-configured rather than throwing', async () => {
+        const r = await wp.sendPush({ endpoint: 'https://push.example/x' }, { title: 'x' });
+        assert.strictEqual(r.ok, false);
+        assert.strictEqual(typeof r.statusCode, 'number', 'the dispatcher needs a status, not an exception');
+    });
+
+    await it('serves no public key until one is set', () => {
+        assert.strictEqual(typeof wp.publicKey(), 'string');
+    });
+
+    await it('the private key is never exposed by status()', () => {
+        const printed = JSON.stringify(wp.status());
+        assert.ok(printed.indexOf('PRIVATE') === -1 || printed.indexOf('hasPrivateKey') >= 0,
+            'status reports only whether a private key exists, never its value');
+        assert.ok(printed.indexOf(process.env.VAPID_PRIVATE_KEY || '\u0000never\u0000') === -1,
+            'the key itself must not appear');
+    });
+});
+
+// ---------------------------------------------------------------
 // Command modules -- what index.js will actually try to register.
 // ---------------------------------------------------------------
 await describe('commands -- every file is registerable', async () => {
